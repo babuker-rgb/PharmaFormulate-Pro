@@ -1,7 +1,7 @@
 # ================================================================
 # Hybrid AI · Multi-Objective Tablet Optimization
 # Nile Valley University · Sudan · v29.28‑R32
-# FINAL ENHANCED – RELAX, BINDER, UNCERTAINTY, REAL DATA
+# FINAL PRODUCTION – ALL FEATURES + BATCHNORM FIX
 # ================================================================
 
 import streamlit as st
@@ -16,7 +16,6 @@ import json
 import os
 import tempfile
 from datetime import datetime
-from io import StringIO
 
 warnings.filterwarnings('ignore')
 
@@ -60,7 +59,7 @@ BINDER_GRADE_NAMES = list(BINDER_GRADES.keys())
 POPULATION_SIZE = 50
 NSGA_GENERATIONS = 80
 TRAINING_EPOCHS = 1200
-UNCERTAINTY_SAMPLES = 30  # Monte Carlo dropout samples
+UNCERTAINTY_SAMPLES = 30
 
 # ================================================================
 # SESSION STATE
@@ -106,7 +105,6 @@ def validate_formulation(api, binder, pvpp, mgst, mcc, moisture):
     return (95 <= total <= 105, f"Total is {total:.1f}% – should be ~100%")
 
 def calculate_quality_score(density, tensile, efrf, api=None):
-    """Base quality score (without API) – used for pure quality assessment."""
     density_score = min(100, (density / 0.95) * 100)
     tensile_score = min(100, (tensile / 8.5) * 100)
     efrf_score = max(0, (1 - efrf) * 100)
@@ -140,7 +138,7 @@ def target_status(value, threshold, mode='min', comfortable=None):
         return "⚠️ Passes (near limit)"
 
 # ================================================================
-# HYBRID NEURAL NETWORK (input_dim=10)
+# HYBRID NEURAL NETWORK (input_dim=10, with dropout)
 # ================================================================
 class HybridTabletModel(nn.Module):
     def __init__(self, input_dim=10, hidden_dim=256, dropout_rate=0.1):
@@ -185,20 +183,43 @@ class HybridTabletModel(nn.Module):
         return torch.stack([density, tensile, efrf, disintegration, dissolution], dim=1)
 
     def predict(self, x, uncertainty=False):
-        """If uncertainty=True, run Monte Carlo dropout and return (mean, std)."""
+        """
+        If uncertainty=True, use Monte Carlo Dropout.
+        Handles single-sample case by replicating to a batch of size UNCERTAINTY_SAMPLES.
+        Returns (mean, std) each shape (batch, 5) or (1, 5) for single input.
+        """
         self.eval()
         with torch.no_grad():
             if isinstance(x, np.ndarray):
                 x = torch.FloatTensor(x)
             if x.dim() == 1:
                 x = x.unsqueeze(0)
+            n_orig = x.shape[0]
+
             if uncertainty:
+                # For MC Dropout, we need batch size > 1 for BatchNorm.
+                # If only one sample, replicate it to create a batch.
+                if n_orig == 1:
+                    x = x.repeat(UNCERTAINTY_SAMPLES, 1)
+
                 self.train()  # enable dropout
                 preds = []
                 for _ in range(UNCERTAINTY_SAMPLES):
                     preds.append(self.forward(x).numpy())
-                preds = np.array(preds)
-                return np.mean(preds, axis=0), np.std(preds, axis=0)
+                preds = np.array(preds)  # shape: (samples, batch, 5)
+
+                if n_orig == 1:
+                    # All rows in batch are identical, take stats across the sample dimension
+                    mean = preds.mean(axis=0)   # shape (batch, 5) but batch=UNCERTAINTY_SAMPLES
+                    std = preds.std(axis=0)
+                    # We want a single result for the original sample, so take the first row (all are same)
+                    return mean[0:1, :], std[0:1, :]  # keep as 2D
+                else:
+                    # Multiple original samples, each has its own predictions across MC samples
+                    # preds shape: (samples, batch, 5) -> we want mean and std over samples axis (axis=0)
+                    mean = preds.mean(axis=0)   # (batch, 5)
+                    std = preds.std(axis=0)     # (batch, 5)
+                    return mean, std
             else:
                 self.eval()
                 return self.forward(x).numpy(), None
@@ -207,37 +228,27 @@ class HybridTabletModel(nn.Module):
 # DATA GENERATION – with binder grade & particle size
 # ================================================================
 def generate_synthetic_data(n_samples=8000, seed=42):
-    """10 inputs: 6 formulation + pressure + speed + binder_grade (0-5) + particle_size.
-       Targets: density, tensile, EFRF, disintegration, dissolution."""
     rng = np.random.default_rng(seed)
-
-    # Formulation components
     bounds = [(API_MIN, API_MAX), (BINDER_MIN, BINDER_MAX), (PVPP_MIN, PVPP_MAX),
               (MGST_MIN, MGST_MAX), (MCC_MIN, MCC_MAX), (MOISTURE_MIN, MOISTURE_MAX)]
     comps = np.column_stack([rng.uniform(lo, hi, n_samples) for lo, hi in bounds])
     comps = comps / comps.sum(axis=1, keepdims=True) * 100.0
     api_n, binder_n, pvpp_n, mgst_n, mcc_n, moisture_n = comps.T
 
-    # Process parameters
     pressure = rng.uniform(PRESSURE_MIN, PRESSURE_MAX, n_samples)
     speed = rng.uniform(SPEED_MIN, SPEED_MAX, n_samples)
-
-    # Binder grade (0..5) and particle size
     binder_grade_idx = rng.integers(0, len(BINDER_GRADE_NAMES), n_samples)
     particle_size = rng.uniform(PARTICLE_SIZE_MIN, PARTICLE_SIZE_MAX, n_samples)
 
     X = np.column_stack([api_n, binder_n, pvpp_n, mgst_n, mcc_n, moisture_n,
                          pressure, speed, binder_grade_idx, particle_size])
 
-    # Binder grade effects on compressibility
     compressibility = np.array([BINDER_GRADES[BINDER_GRADE_NAMES[i]]["compressibility"] for i in binder_grade_idx])
 
-    # Density: Heckel-style with binder grade factor
     density_base = 0.85 - 0.3 * np.exp(-0.01 * (pressure - PRESSURE_MIN))
-    density_base += 0.05 * (compressibility - 0.8)  # higher compressibility → higher density
+    density_base += 0.05 * (compressibility - 0.8)
     density = np.clip(density_base + rng.normal(0, 0.01, n_samples), 0.55, 0.95)
 
-    # Tensile: binder & density, reduced by MgSt and particle size
     tensile = (0.5 + 6.0 * (density - 0.55) / 0.40
                + 0.4 * (binder_n - BINDER_MIN) / (BINDER_MAX - BINDER_MIN)
                + 0.2 * (compressibility - 0.8) * 5
@@ -246,7 +257,6 @@ def generate_synthetic_data(n_samples=8000, seed=42):
                + 0.3 * (api_n - API_MIN) / (API_MAX - API_MIN))
     tensile = np.clip(tensile + rng.normal(0, 0.1, n_samples), 0.5, 8.5)
 
-    # EFRF: lower with better binder and higher density
     efrf = (0.55 - 0.35 * (density - 0.55) / 0.40
             + 0.25 * (api_n - API_MIN) / (API_MAX - API_MIN)
             - 0.15 * (compressibility - 0.8)
@@ -254,14 +264,12 @@ def generate_synthetic_data(n_samples=8000, seed=42):
             + 0.05 * (particle_size - PARTICLE_SIZE_MIN) / (PARTICLE_SIZE_MAX - PARTICLE_SIZE_MIN))
     efrf = np.clip(efrf + rng.normal(0, 0.03, n_samples), 0.02, 0.98)
 
-    # Disintegration: PVPP speeds it, binder/particle size slow it
     disintegration = (12.0 - 4.0 * (pvpp_n - PVPP_MIN) / (PVPP_MAX - PVPP_MIN)
                       + 5.0 * (binder_n - BINDER_MIN) / (BINDER_MAX - BINDER_MIN)
                       + 3.0 * (moisture_n - MOISTURE_MIN) / (MOISTURE_MAX - MOISTURE_MIN)
                       + 2.0 * (particle_size - PARTICLE_SIZE_MIN) / (PARTICLE_SIZE_MAX - PARTICLE_SIZE_MIN))
     disintegration = np.clip(disintegration + rng.normal(0, 0.5, n_samples), 2.0, 45.0)
 
-    # Dissolution: correlated with disintegration and PVPP
     dissolution = 1.8 * disintegration + 5.0 - 3.0 * (pvpp_n - PVPP_MIN) / (PVPP_MAX - PVPP_MIN)
     dissolution = np.clip(dissolution + rng.normal(0, 1.0, n_samples), 10.0, 90.0)
 
@@ -280,16 +288,13 @@ class InputScaler:
 # ================================================================
 # TRAINING – with real data upload support
 # ================================================================
-CHECKPOINT_PATH = os.path.join(tempfile.gettempdir(), 'co_hybai_v29_28_r32_v5.pt')
+CHECKPOINT_PATH = os.path.join(tempfile.gettempdir(), 'co_hybai_v29_28_r32_v6.pt')
 
 @st.cache_resource(show_spinner=False)
 def train_model(real_data_df=None):
-    """If real_data_df is provided, train on that; else use synthetic."""
-    # Check if a checkpoint exists that matches the data source
     if os.path.exists(CHECKPOINT_PATH):
         try:
             ckpt = torch.load(CHECKPOINT_PATH, map_location='cpu', weights_only=False)
-            # Check if checkpoint was trained on same data source
             if (real_data_df is None and ckpt.get('data_source') == 'synthetic') or \
                (real_data_df is not None and ckpt.get('data_source') == 'real'):
                 model = HybridTabletModel(input_dim=10, hidden_dim=256)
@@ -301,7 +306,6 @@ def train_model(real_data_df=None):
             pass
 
     if real_data_df is not None:
-        # Use real data
         required_cols = ['API','Binder','PVPP','MgSt','MCC','Moisture',
                          'Pressure','Speed','BinderGrade','ParticleSize',
                          'Density','Tensile','EFRF','Disintegration','Dissolution']
@@ -319,7 +323,6 @@ def train_model(real_data_df=None):
     scaler = InputScaler().fit(X)
     X_scaled = scaler.transform(X)
 
-    # Split
     n_val = int(0.2 * len(X))
     perm = np.random.default_rng(0).permutation(len(X))
     val_idx, train_idx = perm[:n_val], perm[n_val:]
@@ -333,7 +336,6 @@ def train_model(real_data_df=None):
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=30, factor=0.5)
 
-    # Weighted loss
     target_var = y_train_t.var(dim=0, unbiased=False)
     target_var = torch.clamp(target_var, min=1e-6)
     def weighted_mse(pred, true):
@@ -382,7 +384,6 @@ def train_model(real_data_df=None):
         model.load_state_dict(best_state)
     model.eval()
 
-    # Per-output R²
     with torch.no_grad():
         val_pred = model(X_val_t)
         ss_res = ((y_val_t - val_pred) ** 2).sum(dim=0)
@@ -409,7 +410,7 @@ def train_model(real_data_df=None):
     return model, scaler, history
 
 # ================================================================
-# NSGA-II OPTIMIZER – with relax toggle & 10 variables
+# NSGA-II OPTIMIZER – 10 vars, relax constraints
 # ================================================================
 class NSGAIIOptimizer:
     def __init__(self, model, scaler, pop_size=50, generations=80,
@@ -438,7 +439,7 @@ class NSGAIIOptimizer:
     def evaluate(self, pop):
         pop_scaled = self.scaler.transform(pop)
         with torch.no_grad():
-            pred = self.model.predict(pop_scaled, uncertainty=False)[0]  # mean only for optimisation
+            pred = self.model.predict(pop_scaled, uncertainty=False)[0]  # mean only
         density = pred[:, 0]
         tensile = pred[:, 1]
         efrf = pred[:, 2]
@@ -452,16 +453,11 @@ class NSGAIIOptimizer:
         tensile = shrink_factor * tensile + (1 - shrink_factor) * self.y_train_mean[1]
         efrf = shrink_factor * efrf + (1 - shrink_factor) * self.y_train_mean[2]
 
-        # Relax constraints?
-        if self.relax:
-            # Penalty for violation is reduced – effectively we allow lower density/tensile and higher EFRF
-            # We still compute objectives but without hard constraints; the Pareto front will explore more.
-            # No additional penalty – just treat the objectives as they are.
-            pass
-
+        # Relax constraints: no extra penalty – let the objectives drive exploration
+        # (The penalty for constraints is already absent in this version)
         fitness = np.column_stack([-density, -tensile, efrf])
 
-        # Penalties (still applied to bias search)
+        # Penalties for low API and low tensile (still applied to bias search)
         api_norm = np.clip((api - 80) / 18, 0.0, 1.0)
         tensile_norm = np.clip(tensile / 8.5, 0.0, 1.0)
         penalty_api = 0.08 * (1 - api_norm)
@@ -582,7 +578,7 @@ class NSGAIIOptimizer:
                             if np.random.random() < 0.1:
                                 lo, hi = self.GENE_BOUNDS[j]
                                 span = hi - lo
-                                if j == 8:  # binder_grade is integer
+                                if j == 8:  # binder_grade integer
                                     child[j] = np.clip(int(child[j] + np.random.normal(0, 0.5)), lo, hi)
                                 else:
                                     child[j] = np.clip(child[j] + np.random.normal(0, 0.1) * span, lo, hi)
@@ -653,7 +649,7 @@ def run_real_optimization(progress_callback=None):
     pareto_idx = fronts[0]
     pareto_pop = final_pop[pareto_idx]
 
-    # Predict with uncertainty for display
+    # Predict with uncertainty
     preds, stds = model.predict(scaler.transform(pareto_pop), uncertainty=True)
     solutions = []
     for i, (row, pred, std) in enumerate(zip(pareto_pop, preds, stds)):
@@ -704,7 +700,7 @@ def get_current_formulation_results_with_uncertainty():
     }
 
 # ================================================================
-# UI RENDER FUNCTIONS (enhanced)
+# UI RENDER FUNCTIONS
 # ================================================================
 def render_sidebar():
     with st.sidebar:
@@ -714,8 +710,6 @@ def render_sidebar():
         st.markdown(f"**Institution:** Nile Valley University")
         st.markdown(f"**Department:** Pharmaceutical Engineering")
         st.markdown("---")
-
-        # NEW: Real data upload
         st.markdown("### 📂 Real Data Upload")
         uploaded_file = st.file_uploader("Upload CSV (formulation-property data)", type=['csv'])
         if uploaded_file is not None:
@@ -724,7 +718,6 @@ def render_sidebar():
                 st.session_state.real_data_df = df
                 st.session_state.real_data_uploaded = True
                 st.success(f"Loaded {len(df)} rows.")
-                # Force retrain next run
                 st.session_state['_trained_model'] = None
                 st.session_state['_trained_scaler'] = None
                 st.session_state['_trained_history'] = None
@@ -733,7 +726,6 @@ def render_sidebar():
         else:
             st.session_state.real_data_uploaded = False
 
-        # NEW: Relax constraints toggle
         st.markdown("### 🎯 Constraint Mode")
         relax = st.checkbox("☑️ Relax constraints (explore wider API range)",
                             value=st.session_state.get('relax_constraints', False))
