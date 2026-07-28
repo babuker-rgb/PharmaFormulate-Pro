@@ -1020,6 +1020,33 @@ def render_input_panel():
         st.session_state.decompression_time = st.slider("**Decompression Time (ms)**", DECOMPRESSION_TIME_MIN, DECOMPRESSION_TIME_MAX, st.session_state.decompression_time, step=2.0,
                                                          help="Reference value only — not yet a model input.")
 
+def target_status(value, threshold, mode='min', comfortable=None):
+    """Returns a status label that reflects actual margin from a target,
+    not just a flat pass/fail. mode='min' means value should be >=
+    threshold (density, tensile — higher is better); mode='max' means
+    value should be <= threshold (EFRF, disintegration — lower is
+    better). `comfortable` is the margin beyond which the result is
+    labelled 'Excellent' rather than just 'Passes' / 'Near limit'.
+
+    NEW: previously several labels (e.g. the golden solution's EFRF and
+    Density badges) were hardcoded to "✅ Excellent" regardless of the
+    actual value — an EFRF of 0.399 (right at the 0.40 limit) showed the
+    same "Excellent" badge as an EFRF of 0.05. This makes the label
+    reflect the real margin.
+    """
+    if mode == 'min':
+        if value < threshold:
+            return "🔴 Below target"
+        if comfortable is not None and value >= comfortable:
+            return "✅ Excellent"
+        return "✅ Passes (near limit)"
+    else:
+        if value > threshold:
+            return "🔴 Exceeds limit"
+        if comfortable is not None and value <= comfortable:
+            return "✅ Excellent"
+        return "⚠️ Passes (near limit)"
+
 def render_results_summary(results):
     st.markdown("---")
     st.markdown("## 📊 Optimization Results")
@@ -1028,12 +1055,16 @@ def render_results_summary(results):
     col1, col2, col3 = st.columns(3)
     with col1:
         st.metric("**API%**", f"{api_val:.1f}%", "🎯 Target: maximize")
-        st.metric("**Density**", f"{results['density']:.3f}", "✅ Target: ≥0.80")
+        st.metric("**Density**", f"{results['density']:.3f}",
+                 target_status(results['density'], 0.80, mode='min', comfortable=0.85))
     with col2:
-        st.metric("**Tensile Strength**", f"{results['tensile']:.2f} MPa", "✅ Target: ≥1.5 MPa")
-        st.metric("**EFRF**", f"{results['efrf']:.3f}", "✅ Target: <0.40")
+        st.metric("**Tensile Strength**", f"{results['tensile']:.2f} MPa",
+                 target_status(results['tensile'], 1.5, mode='min', comfortable=3.0))
+        st.metric("**EFRF**", f"{results['efrf']:.3f}",
+                 target_status(results['efrf'], 0.40, mode='max', comfortable=0.30))
     with col3:
-        st.metric("**Disintegration Time**", f"{results['disintegration']:.1f} min", "✅ Target: ≤15 min")
+        st.metric("**Disintegration Time**", f"{results['disintegration']:.1f} min",
+                 target_status(results['disintegration'], 15.0, mode='max', comfortable=10.0))
         st.metric("**Overall Quality Score**", f"{quality['overall']:.1f}%",
                  "Good" if quality['overall'] > 60 else "Needs Improvement")
     with st.expander("📊 Quality Score Breakdown", expanded=False):
@@ -1171,6 +1202,9 @@ def render_golden_solution(golden):
         return
     st.markdown("---")
     st.markdown("## 🏆 Golden Solution (Balanced Trade-off)")
+    density_status = target_status(golden['Density'], 0.80, mode='min', comfortable=0.85)
+    tensile_status = target_status(golden['Tensile (MPa)'], 1.5, mode='min', comfortable=3.0)
+    efrf_status = target_status(golden['EFRF'], 0.40, mode='max', comfortable=0.30)
     st.markdown(f"""
     <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
                 padding: 20px; border-radius: 12px; color: white; box-shadow: 0 4px 12px rgba(0,0,0,0.15);">
@@ -1183,14 +1217,25 @@ def render_golden_solution(golden):
            <b>Moisture:</b> {golden['Moisture (%)']:.1f}%</p>
         <div style="display: flex; gap: 20px; flex-wrap: wrap; margin-top: 10px;">
             <div><b>API%:</b> {golden['API (%)']:.1f}% 🎯 High</div>
-            <div><b>Density:</b> {golden['Density']:.3f} ✅ Excellent</div>
-            <div><b>Tensile:</b> {golden['Tensile (MPa)']:.2f} MPa ✅ Improved</div>
-            <div><b>EFRF:</b> {golden['EFRF']:.3f} ✅ Excellent</div>
+            <div><b>Density:</b> {golden['Density']:.3f} {density_status}</div>
+            <div><b>Tensile:</b> {golden['Tensile (MPa)']:.2f} MPa {tensile_status}</div>
+            <div><b>EFRF:</b> {golden['EFRF']:.3f} {efrf_status}</div>
             <div><b>Quality Score:</b> {golden['Quality Score']:.1f}% 🏆 Best</div>
         </div>
     </div>
     """, unsafe_allow_html=True)
-    st.success("✅ This formulation maximises API% and Tensile while preserving excellent tablet quality!")
+    # NEW: this used to be a flat "excellent tablet quality!" claim
+    # regardless of the actual margins above — e.g. an EFRF of 0.399,
+    # right at the 0.40 limit, got the same message as an EFRF of 0.05.
+    # Now reflects whether any property is only marginally passing.
+    near_limit = any("near limit" in s or "Below target" in s or "Exceeds limit" in s
+                    for s in (density_status, tensile_status, efrf_status))
+    if near_limit:
+        st.warning("⚠️ This is the best available trade-off among the Pareto-optimal solutions found, "
+                   "but at least one property (see badges above) is close to its limit rather than "
+                   "comfortably within it — worth reviewing before committing to this formulation.")
+    else:
+        st.success("✅ This formulation maximises API% and Tensile while preserving excellent tablet quality!")
 
 def render_side_by_side_comparison(golden, all_solutions):
     if not golden or not all_solutions:
@@ -1410,6 +1455,14 @@ def main():
         st.session_state.golden_solution = golden
         st.session_state.best_solutions = solutions
         st.session_state.pareto_history = gen_history
+        # BUGFIX: this was previously assigned AFTER render_optimization_summary()
+        # was called below, so the summary always displayed the stale runtime
+        # from the *previous* run (or 0/"—" on the first run) — the
+        # "Evaluations/Second" figure was then dividing by that stale value
+        # via max(1, runtime), producing an implausible constant like 4000/1=4000
+        # instead of the real ~147/s. Moved before the render calls that
+        # actually display it.
+        st.session_state.runtime = round(time.time() - start_time, 1)
 
         render_results_summary(st.session_state.results)
         render_pareto_evolution()
@@ -1418,7 +1471,6 @@ def main():
         render_best_solutions()
         render_optimization_summary()
 
-        st.session_state.runtime = round(time.time() - start_time, 1)
         st.success(f"⏱️ Optimization completed in {st.session_state.runtime} seconds!")
         st.balloons()
 
