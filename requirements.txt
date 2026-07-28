@@ -1,0 +1,14 @@
+# Core dependencies
+streamlit
+numpy
+pandas
+torch
+plotly
+scikit-learn
+scipy
+matplotlib
+seaborn
+pydantic
+python-dotenv
+joblib
+tqdm
