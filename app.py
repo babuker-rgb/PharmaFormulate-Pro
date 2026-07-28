@@ -679,8 +679,19 @@ class NSGAIIOptimizer:
                     'pareto_objectives': obj[pareto_indices]
                 })
             yield pop, obj, history, gen
-        fronts = self.fast_non_dominated_sort(obj)
-        yield pop, obj, history, self.generations
+        # BUGFIX: there was previously an extra yield here —
+        # `yield pop, obj, history, self.generations` — re-emitting the
+        # exact same pop/obj/history the loop's final iteration (gen ==
+        # self.generations - 1) had already yielded one line above,
+        # except labelled with gen = self.generations (80 for the default
+        # config) instead of a valid 0-indexed generation number (0..79).
+        # That's harmless to callers that only look at the final pop/obj
+        # (like run_real_optimization did), but the new live-progress
+        # callback computed `(gen + 1) / total` from it — 81/80 — which is
+        # outside st.progress()'s valid [0.0, 1.0] range and raised
+        # StreamlitAPIException. Since this final yield added no new
+        # information beyond what the loop already produced, it's removed
+        # rather than patched around.
 
 # ================================================================
 # REAL RESULT FUNCTIONS (replace the previous np.random fabrications)
@@ -1346,7 +1357,12 @@ def main():
         render_training_progress()
         opt_progress = st.progress(0, text="Running NSGA-II generation 0/%d..." % NSGA_GENERATIONS)
         def _update_opt_progress(gen, total):
-            opt_progress.progress((gen + 1) / total, text=f"Running NSGA-II generation {gen + 1}/{total}...")
+            # Defensive clamp: st.progress() raises if given anything
+            # outside [0.0, 1.0]. The underlying generator is fixed to
+            # never yield gen >= total now, but clamping here means this
+            # can't crash again even if that changes.
+            frac = min(1.0, max(0.0, (gen + 1) / total))
+            opt_progress.progress(frac, text=f"Running NSGA-II generation {min(gen + 1, total)}/{total}...")
         solutions, golden, gen_history = run_real_optimization(progress_callback=_update_opt_progress)
         opt_progress.empty()
         st.session_state.results = get_current_formulation_results()
