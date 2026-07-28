@@ -297,7 +297,7 @@ class InputScaler:
 # trained under the old, scale-imbalanced loss (which had learned to
 # essentially ignore EFRF). If you're iterating further, bump this again
 # any time train_model()'s loss/data-generation logic changes.
-CHECKPOINT_PATH = os.path.join(tempfile.gettempdir(), 'co_hybai_v29_28_r32_v3.pt')
+CHECKPOINT_PATH = os.path.join(tempfile.gettempdir(), 'co_hybai_v29_28_r32_v4.pt')
 
 @st.cache_resource(show_spinner=False)
 def train_model():
@@ -427,6 +427,11 @@ def train_model():
     }
     history['n_train'] = len(train_idx)
     history['n_val'] = len(val_idx)
+    # NEW: per-output training-target means, used by NSGAIIOptimizer to
+    # shrink predictions for out-of-distribution candidates back toward a
+    # plausible value instead of trusting an extrapolated (and often
+    # saturated/ceiling) raw prediction. See NSGAIIOptimizer.evaluate().
+    history['y_train_mean'] = y_train_t.mean(dim=0).numpy().tolist()
 
     torch.save({'model_state': model.state_dict(), 'scaler': scaler, 'history': history}, CHECKPOINT_PATH)
     return model, scaler, history
@@ -434,12 +439,17 @@ def train_model():
 
 
 class NSGAIIOptimizer:
-    def __init__(self, model, scaler, pop_size=50, generations=80):
+    def __init__(self, model, scaler, pop_size=50, generations=80, y_train_mean=None):
         self.model = model
         self.scaler = scaler
         self.pop_size = pop_size
         self.generations = generations
         self.n_objectives = 3  # Density, Tensile, EFRF
+        # Training-target means (density, tensile, efrf, disintegration,
+        # dissolution) used to shrink out-of-distribution predictions back
+        # toward a plausible value in evaluate(). Falls back to reasonable
+        # mid-range defaults if not supplied.
+        self.y_train_mean = y_train_mean if y_train_mean is not None else [0.75, 4.5, 0.5, 20.0, 45.0]
 
     def enforce_mass_balance(self, pop):
         # BUGFIX: this previously only rescaled the six formulation
@@ -479,6 +489,33 @@ class NSGAIIOptimizer:
         tensile = pred[:, 1]
         efrf = pred[:, 2]
         api = pop[:, 0]  # API% (first variable, already normalized)
+
+        # BUGFIX (root-cause fix, replacing an earlier additive-penalty
+        # attempt): even after boundary-augmenting the training data
+        # twice, NSGA-II kept converging on corners the surrogate model
+        # extrapolates in — most recently a point where the model
+        # predicted density=0.950 (its sigmoid output's hard ceiling) even
+        # though the TRUE synthetic ground-truth formula caps out at 0.865
+        # at the maximum possible pressure (verified directly). Patching
+        # each individual corner as it's discovered is whack-a-mole. A
+        # first attempt added a flat penalty to the fitness objectives,
+        # but that has a scale-mismatch problem: density's entire natural
+        # objective range is only ~0.4, so a penalty large enough to
+        # matter there would completely swamp the ~8-wide tensile
+        # objective, or vice versa if kept small. Instead, out-of-
+        # distribution PREDICTIONS themselves are shrunk toward the
+        # training-target mean before objectives are computed — this
+        # automatically scales correctly per-property (a shrunk density
+        # stays within density's own natural range, a shrunk tensile
+        # within tensile's), and pulls values like the exploited corner's
+        # density=0.95 back down close to what the true physics actually
+        # supports (verified: shrinks to ~0.83, near the true ~0.865 cap).
+        ood_z = np.abs(pop_scaled)
+        ood_raw = np.clip(ood_z - 2.0, 0, None).sum(axis=1)  # 0 for well-covered points, grows for extrapolation
+        shrink_factor = 1.0 / (1.0 + ood_raw)  # 1.0 = trust the prediction fully; ->0 = trust the training mean instead
+        density = shrink_factor * density + (1 - shrink_factor) * self.y_train_mean[0]
+        tensile = shrink_factor * tensile + (1 - shrink_factor) * self.y_train_mean[1]
+        efrf = shrink_factor * efrf + (1 - shrink_factor) * self.y_train_mean[2]
 
         # Base objectives (all to be minimized)
         fitness = np.column_stack([
@@ -703,6 +740,7 @@ def run_real_training_and_get_history():
     model, scaler, history = train_model()
     st.session_state['_trained_model'] = model
     st.session_state['_trained_scaler'] = scaler
+    st.session_state['_trained_history'] = history
     return history
 
 def run_real_optimization(progress_callback=None):
@@ -714,12 +752,15 @@ def run_real_optimization(progress_callback=None):
     UI can show live progress instead of a single opaque spinner."""
     model = st.session_state.get('_trained_model')
     scaler = st.session_state.get('_trained_scaler')
-    if model is None or scaler is None:
-        model, scaler, _ = train_model()
+    history = st.session_state.get('_trained_history')
+    if model is None or scaler is None or history is None:
+        model, scaler, history = train_model()
         st.session_state['_trained_model'] = model
         st.session_state['_trained_scaler'] = scaler
+        st.session_state['_trained_history'] = history
 
-    optimizer = NSGAIIOptimizer(model, scaler, pop_size=POPULATION_SIZE, generations=NSGA_GENERATIONS)
+    optimizer = NSGAIIOptimizer(model, scaler, pop_size=POPULATION_SIZE, generations=NSGA_GENERATIONS,
+                                y_train_mean=history.get('y_train_mean'))
     gen_history = []
     final_pop, final_obj = None, None
     for pop, obj, history, gen in optimizer.optimize(n_vars=8):
@@ -826,7 +867,7 @@ def render_sidebar():
                         help="Discard the cached model and retrain from scratch on the next run. "
                              "Use this after changing training/data-generation code."):
                 train_model.clear()
-                for key in ('_trained_model', '_trained_scaler'):
+                for key in ('_trained_model', '_trained_scaler', '_trained_history'):
                     st.session_state.pop(key, None)
                 if os.path.exists(CHECKPOINT_PATH):
                     try:
