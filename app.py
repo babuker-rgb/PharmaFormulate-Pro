@@ -1,7 +1,7 @@
 # ================================================================
 # Hybrid AI · Multi-Objective Tablet Optimization
 # Nile Valley University · Sudan · v29.28‑R32
-# FINAL – GOLDEN ON PARETO LINE + HARD CONSTRAINTS
+# FINAL – GOLDEN ON PARETO LINE + HARD CONSTRAINTS (FIXED)
 # ================================================================
 
 import streamlit as st
@@ -30,7 +30,7 @@ st.set_page_config(
 )
 
 # ================================================================
-# CONSTANTS (Hard constraints – fixed)
+# CONSTANTS
 # ================================================================
 API_MIN, API_MAX = 80.0, 98.0
 BINDER_MIN, BINDER_MAX = 1.4, 6.0
@@ -57,8 +57,8 @@ BINDER_GRADES = {
 }
 BINDER_GRADE_NAMES = list(BINDER_GRADES.keys())
 
-POPULATION_SIZE = 50
-NSGA_GENERATIONS = 80
+POPULATION_SIZE = 80
+NSGA_GENERATIONS = 100
 TRAINING_EPOCHS = 1200
 
 # ================================================================
@@ -77,7 +77,9 @@ def initialize_session_state():
         'user_data': None, 'data_source': 'synthetic',
         'force_retrain': False,
         'pareto_plot_type': 'API vs EFRF',
-        'selected_generation': None
+        'selected_generation': None,
+        'final_pareto_pop': None,
+        'final_pareto_obj': None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -171,7 +173,7 @@ class HybridTabletModel(nn.Module):
             return self.forward(x).numpy()
 
 # ================================================================
-# DATA GENERATION (Physics‑based synthetic data)
+# DATA GENERATION
 # ================================================================
 N_SAMPLES = 8000
 BOUNDARY_FRACTION = 0.30
@@ -247,8 +249,8 @@ class InputScaler:
 # ================================================================
 # CHECKPOINT PATHS AND TRAINING
 # ================================================================
-CHECKPOINT_SYNTHETIC = os.path.join(tempfile.gettempdir(), 'co_hybai_synthetic_v13.pt')
-CHECKPOINT_REAL = os.path.join(tempfile.gettempdir(), 'co_hybai_real_v13.pt')
+CHECKPOINT_SYNTHETIC = os.path.join(tempfile.gettempdir(), 'co_hybai_synthetic_v14.pt')
+CHECKPOINT_REAL = os.path.join(tempfile.gettempdir(), 'co_hybai_real_v14.pt')
 
 @st.cache_resource(show_spinner=False)
 def train_model(use_real=False, real_df=None):
@@ -376,7 +378,7 @@ def train_model(use_real=False, real_df=None):
     return model, scaler, history
 
 # ================================================================
-# NSGA-II OPTIMIZER – 2 OBJECTIVES (with hard constraints)
+# NSGA-II OPTIMIZER – 2 OBJECTIVES + HARD CONSTRAINTS (FIXED)
 # ================================================================
 class NSGAIIOptimizer:
     def __init__(self, model, scaler, pop_size=50, generations=80, y_train_mean=None):
@@ -386,6 +388,12 @@ class NSGAIIOptimizer:
         self.generations = generations
         self.n_objectives = 2
         self.y_train_mean = y_train_mean if y_train_mean is not None else [0.75, 4.5, 0.5, 20.0, 45.0]
+        # Hard constraint thresholds
+        self.d_min, self.d_max = 0.72, 0.99
+        self.tensile_min = 1.5
+        self.efrf_max = 0.40
+        self.dis_max = 15.0
+        self.mcc_min, self.mcc_max = 2.0, 8.0
 
     def enforce_mass_balance(self, pop):
         balanced = pop.copy()
@@ -419,19 +427,21 @@ class NSGAIIOptimizer:
         efrf = shrink_factor * efrf + (1 - shrink_factor) * self.y_train_mean[2]
         disintegration = shrink_factor * disintegration + (1 - shrink_factor) * self.y_train_mean[3]
         
-        # ---- Hard constraints -> violation (for constraint dominance) ----
+        # ---- HARD CONSTRAINT VIOLATION ----
         violation = np.zeros(len(pop))
-        violation += np.maximum(0, 0.72 - density) + np.maximum(0, density - 0.99)
-        violation += np.maximum(0, 1.5 - tensile)
-        violation += np.maximum(0, efrf - 0.40)
-        violation += np.maximum(0, disintegration - 15.0)
+        violation += np.maximum(0, self.d_min - density) + np.maximum(0, density - self.d_max)
+        violation += np.maximum(0, self.tensile_min - tensile)
+        violation += np.maximum(0, efrf - self.efrf_max)
+        violation += np.maximum(0, disintegration - self.dis_max)
         mcc = pop[:, 1]
-        violation += np.maximum(0, 2.0 - mcc) + np.maximum(0, mcc - 8.0)
+        violation += np.maximum(0, self.mcc_min - mcc) + np.maximum(0, mcc - self.mcc_max)
         
-        # ---- Two objectives ----
+        # ---- OBJECTIVES: maximize API (-api), minimize EFRF ----
+        # Add a large penalty to infeasible solutions so they are dominated
+        penalty = 100.0 * violation  # large penalty for constraint violation
         fitness = np.column_stack([
-            -api,   # maximise API
-            efrf    # minimise EFRF
+            -api + penalty,   # maximise API (penalise violation)
+            efrf + penalty    # minimise EFRF (penalise violation)
         ])
         return fitness, violation
 
@@ -444,7 +454,7 @@ class NSGAIIOptimizer:
             for j in range(n):
                 if i == j:
                     continue
-                # Constraint dominance: if j has lower violation, or both feasible and j dominates
+                # Constraint dominance: if j has lower violation, OR both feasible and j dominates
                 if (violations[j] < violations[i]) or \
                    (violations[j] == 0 and violations[i] == 0 and
                     np.all(obj[j] <= obj[i]) and np.any(obj[j] < obj[i])):
@@ -613,28 +623,35 @@ def run_real_optimization(progress_callback=None):
                                 y_train_mean=history.get('y_train_mean'))
     gen_history = []
     final_pop, final_obj = None, None
+    final_viol = None
     for pop, obj, history, gen in optimizer.optimize(n_vars=8):
         final_pop, final_obj = pop, obj
+        # We need violations for the final population – recompute them
+        # We'll store the history, but for the final front we'll recompute from final_pop
         if history:
             gen_history = history
         if progress_callback is not None:
             progress_callback(gen, NSGA_GENERATIONS)
 
-    # Extract Pareto front (first front)
-    # We need to recompute the front from final_obj and zeros violation (all feasible)
-    # But we already have the front from the last generation's history.
-    # However, the history stores the front, so we can get the last front.
-    if gen_history:
-        last = gen_history[-1]
-        pareto_idx = last['pareto_indices']
-        pareto_pop = last['pareto_solutions']
-        pareto_obj = last['pareto_objectives']
-    else:
-        # fallback
-        fronts = optimizer.fast_non_dominated_sort(final_obj, np.zeros(len(final_pop)))
-        pareto_idx = fronts[0]
-        pareto_pop = final_pop[pareto_idx]
-        pareto_obj = final_obj[pareto_idx]
+    # Recompute violations and front from the final population
+    final_obj, final_viol = optimizer.evaluate(final_pop)
+    fronts = optimizer.fast_non_dominated_sort(final_obj, final_viol)
+    pareto_idx = fronts[0]
+    pareto_pop = final_pop[pareto_idx]
+    pareto_obj = final_obj[pareto_idx]
+    pareto_viol = final_viol[pareto_idx]
+
+    # Filter to only feasible solutions (violation == 0)
+    feasible_mask = pareto_viol < 1e-6
+    pareto_pop = pareto_pop[feasible_mask]
+    pareto_obj = pareto_obj[feasible_mask]
+
+    if len(pareto_pop) == 0:
+        st.warning("No feasible solutions found! Try relaxing constraints or increasing population/generations.")
+        # Use the best (lowest violation) as fallback
+        best_idx = np.argmin(final_viol)
+        pareto_pop = final_pop[[best_idx]]
+        pareto_obj = final_obj[[best_idx]]
 
     preds = model.predict(scaler.transform(pareto_pop))
     solutions = []
@@ -663,8 +680,8 @@ def run_real_optimization(progress_callback=None):
     st.session_state.golden_solution = golden
     st.session_state.best_solutions = solutions
     st.session_state.pareto_history = gen_history
-    st.session_state.final_front_pop = pareto_pop
-    st.session_state.final_front_obj = pareto_obj
+    st.session_state.final_pareto_pop = pareto_pop
+    st.session_state.final_pareto_obj = pareto_obj
 
     return solutions, golden, gen_history
 
@@ -1046,9 +1063,18 @@ def render_pareto_evolution():
     )
     st.session_state.selected_generation = gen_slider
 
-    current_entry = next(h for h in pareto_history if h['generation'] == gen_slider)
-    current_obj = current_entry['pareto_objectives']
-    current_pop = current_entry['pareto_solutions']
+    # Get the stored final Pareto front
+    final_pareto_pop = st.session_state.get('final_pareto_pop')
+    final_pareto_obj = st.session_state.get('final_pareto_obj')
+    
+    # Use the stored final front for the last generation view
+    if gen_slider == generations_recorded[-1] and final_pareto_pop is not None:
+        current_pop = final_pareto_pop
+        current_obj = final_pareto_obj
+    else:
+        current_entry = next(h for h in pareto_history if h['generation'] == gen_slider)
+        current_obj = current_entry['pareto_objectives']
+        current_pop = current_entry['pareto_solutions']
     
     api_vals = current_pop[:, 0]
     efrf_vals = current_obj[:, 1]   # second objective is EFRF
@@ -1175,7 +1201,7 @@ def render_pareto_evolution():
                 hovertemplate=f'<b>Golden</b><br>{x_label}: %{{x:.3f}}<br>{y_label}: %{{y:.3f}}<extra></extra>'
             ))
         else:
-            st.caption("Golden solution not found in this front (it may be from a different generation).")
+            st.caption("Golden solution not found in this front.")
     elif golden and gen_slider != final_gen:
         st.caption("The golden solution is from the final generation; it is not shown on this earlier front.")
 
