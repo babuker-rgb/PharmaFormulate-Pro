@@ -1,7 +1,7 @@
 # ================================================================
 # Hybrid AI · Multi-Objective Tablet Optimization
 # Nile Valley University · Sudan · v29.28‑R32
-# VERSION 8 – REAL DATA UPLOAD + PARETO PLOT IMPROVEMENTS
+# VERSION 9 – PARETO LINE, BOUNDARIES & FEASIBLE REGION
 # ================================================================
 
 import streamlit as st
@@ -30,7 +30,7 @@ st.set_page_config(
 )
 
 # ================================================================
-# CONSTANTS (same as before)
+# CONSTANTS
 # ================================================================
 API_MIN, API_MAX = 80.0, 98.0
 BINDER_MIN, BINDER_MAX = 1.4, 6.0
@@ -82,7 +82,7 @@ def initialize_session_state():
 initialize_session_state()
 
 # ================================================================
-# HELPER FUNCTIONS (unchanged)
+# HELPER FUNCTIONS
 # ================================================================
 def normalize_formulation(api, binder, pvpp, mgst, mcc, moisture):
     comps = np.array([api, binder, pvpp, mgst, mcc, moisture])
@@ -125,7 +125,7 @@ def calculate_quality_score(density, tensile, efrf, api=None):
                 'weights': weights}
 
 # ================================================================
-# HYBRID NEURAL NETWORK (unchanged)
+# HYBRID NEURAL NETWORK
 # ================================================================
 class HybridTabletModel(nn.Module):
     def __init__(self, input_dim=8, hidden_dim=256):
@@ -244,12 +244,9 @@ class InputScaler:
 # ================================================================
 # CHECKPOINT PATHS
 # ================================================================
-CHECKPOINT_SYNTHETIC = os.path.join(tempfile.gettempdir(), 'co_hybai_synthetic_v8.pt')
+CHECKPOINT_SYNTHETIC = os.path.join(tempfile.gettempdir(), 'co_hybai_synthetic_v9.pt')
 
 def _data_fingerprint(df):
-    """Cheap, stable content fingerprint for a real-data upload, used both
-    as the @st.cache_resource key and to name the on-disk checkpoint —
-    see the BUGFIX note in train_model() for why this matters."""
     try:
         row_hash = int(pd.util.hash_pandas_object(df, index=False).sum())
     except Exception:
@@ -258,31 +255,6 @@ def _data_fingerprint(df):
 
 @st.cache_resource(show_spinner=False)
 def train_model(use_real=False, _real_df=None, data_fingerprint=None):
-    """Train or load a cached model.
-
-    BUGFIX: `real_df` was previously passed to @st.cache_resource as a
-    regular (hashed) argument, AND the checkpoint path for real data was a
-    single fixed filename (CHECKPOINT_REAL) regardless of what was in it.
-    That combination is broken in a specific, silent way: uploading
-    dataset A trains and saves to CHECKPOINT_REAL. Later uploading a
-    *different* dataset B calls train_model(use_real=True, real_df=df_B) —
-    Streamlit's cache correctly sees this as a new call (df_B hashes
-    differently from df_A) and re-executes the function body, but the
-    function body's very first move is `if os.path.exists(checkpoint_path):
-    load and return` — and CHECKPOINT_REAL still exists on disk from
-    dataset A's training run. So it silently loads and returns the model
-    trained on A, never looking at B's content at all. The user would see
-    "Loaded N samples" for their new upload but get predictions from the
-    old dataset with no indication anything was wrong.
-    Fixed two ways: (1) the real dataframe is now passed as `_real_df`
-    (underscore-prefixed, so Streamlit's cache_resource does not hash the
-    — potentially large — dataframe itself), and a cheap content
-    `data_fingerprint` string is passed instead as the actual cache key;
-    (2) the on-disk checkpoint filename is now derived from that same
-    fingerprint, so a genuinely different upload gets a genuinely
-    different checkpoint path and the stale-load path above can no longer
-    trigger for different data.
-    """
     if use_real and _real_df is not None and data_fingerprint:
         checkpoint_path = os.path.join(tempfile.gettempdir(), f'co_hybai_real_{data_fingerprint}.pt')
     else:
@@ -682,7 +654,7 @@ def get_current_formulation_results():
     }
 
 # ================================================================
-# UI RENDER FUNCTIONS (modified)
+# UI RENDER FUNCTIONS
 # ================================================================
 def render_sidebar():
     with st.sidebar:
@@ -708,13 +680,6 @@ def render_sidebar():
                 if missing:
                     st.error(f"Missing columns: {missing}")
                 else:
-                    # NEW: previously only column *presence* was checked —
-                    # non-numeric values or NaNs in the required columns
-                    # would only surface later as a confusing crash deep
-                    # inside train_model() (e.g. a bare .astype(np.float32)
-                    # failure), or worse, silently propagate as NaN into
-                    # training. Validated up front instead, with a message
-                    # that says exactly what's wrong.
                     numeric_df = df[required_cols].apply(pd.to_numeric, errors='coerce')
                     bad_cols = [c for c in required_cols if numeric_df[c].isna().any()]
                     if bad_cols:
@@ -726,12 +691,6 @@ def render_sidebar():
                     else:
                         st.session_state.user_data = df
                         st.success(f"✅ Loaded {len(df)} samples")
-                        # NEW: this flag was previously set here and never read
-                        # anywhere — dead state. It now drives the info message
-                        # just below. (Retraining itself no longer depends on
-                        # this flag: the data-fingerprint fix to train_model()
-                        # means a genuinely different upload already gets its
-                        # own cache key automatically.)
                         st.session_state.force_retrain = True
             except Exception as e:
                 st.error(f"Error reading file: {e}")
@@ -747,11 +706,6 @@ def render_sidebar():
                     "Quick Predict or Run Hybrid Optimization.")
 
         if st.button("🔄 Force Retrain", use_container_width=True):
-            # BUGFIX: CHECKPOINT_REAL no longer exists as a fixed path —
-            # checkpoints for real-data uploads are now named from a
-            # content fingerprint (see train_model()), so this glob
-            # removes all of them regardless of which upload created them,
-            # instead of referencing an undefined name.
             import glob
             checkpoints_to_remove = [CHECKPOINT_SYNTHETIC] + glob.glob(
                 os.path.join(tempfile.gettempdir(), 'co_hybai_real_*.pt'))
@@ -997,6 +951,58 @@ def render_training_progress():
                 f"{history.get('n_val', '?')} held-out samples."
             )
 
+# ---- Helper to generate feasible samples ----
+def generate_feasible_samples(model, scaler, n_samples=3000):
+    """Generate random formulations, predict, and return feasible ones (all constraints)."""
+    if model is None or scaler is None:
+        return np.array([]), np.array([])
+    try:
+        rng = np.random.default_rng(0)
+        api = rng.uniform(API_MIN, API_MAX, n_samples)
+        binder = rng.uniform(BINDER_MIN, BINDER_MAX, n_samples)
+        pvpp = rng.uniform(PVPP_MIN, PVPP_MAX, n_samples)
+        mgst = rng.uniform(MGST_MIN, MGST_MAX, n_samples)
+        mcc = rng.uniform(MCC_MIN, MCC_MAX, n_samples)
+        moisture = rng.uniform(MOISTURE_MIN, MOISTURE_MAX, n_samples)
+        pressure = rng.uniform(PRESSURE_MIN, PRESSURE_MAX, n_samples)
+        speed = rng.uniform(SPEED_MIN, SPEED_MAX, n_samples)
+
+        comps = np.column_stack([api, binder, pvpp, mgst, mcc, moisture])
+        lo = np.array([API_MIN, BINDER_MIN, PVPP_MIN, MGST_MIN, MCC_MIN, MOISTURE_MIN])
+        hi = np.array([API_MAX, BINDER_MAX, PVPP_MAX, MGST_MAX, MCC_MAX, MOISTURE_MAX])
+        comps_clipped = np.clip(comps, lo, hi)
+        total = comps_clipped.sum(axis=1, keepdims=True)
+        total = np.where(total <= 0, 1.0, total)
+        norm = comps_clipped / total * 100.0
+        norm = np.clip(norm, lo, hi)
+        total2 = norm.sum(axis=1, keepdims=True)
+        total2 = np.where(total2 <= 0, 1.0, total2)
+        norm = norm * (100.0 / total2)
+        norm = np.clip(norm, lo, hi)
+
+        X = np.column_stack([norm, pressure, speed])
+        X_scaled = scaler.transform(X)
+        preds = model.predict(X_scaled)
+
+        density = preds[:, 0]
+        tensile = preds[:, 1]
+        efrf = preds[:, 2]
+        disintegration = preds[:, 3]
+
+        feasible_mask = (
+            (density >= 0.72) & (density <= 0.99) &
+            (tensile >= 1.5) &
+            (efrf < 0.40) &
+            (disintegration <= 15.0) &
+            (norm[:, 4] >= 2.0) & (norm[:, 4] <= 8.0)
+        )
+        feasible_api = norm[feasible_mask, 0]
+        feasible_efrf = efrf[feasible_mask]
+        return feasible_api, feasible_efrf
+    except Exception:
+        return np.array([]), np.array([])
+
+# ---- UPDATED PARETO PLOT ----
 def render_pareto_evolution():
     st.markdown("---")
     st.markdown("## 🌐 Pareto Front Evolution: API% vs EFRF")
@@ -1016,36 +1022,74 @@ def render_pareto_evolution():
     api_vals = current_pop[:, 0]
     efrf_vals = current_obj[:, 2]
 
-    # NEW: locked to a single API% (x) vs EFRF (y) view, with the golden
-    # solution marked as a gold star and the formulation currently on the
-    # sliders (from Quick Predict / the last optimization run) marked as a
-    # blue circle, so the two reference points requested are always
-    # visible on the same chart instead of requiring a plot-type switch.
+    # Get model and scaler for feasible region
+    model = st.session_state.get('_trained_model')
+    scaler = st.session_state.get('_trained_scaler')
+    feat_api, feat_efrf = np.array([]), np.array([])
+    if model is not None and scaler is not None:
+        try:
+            feat_api, feat_efrf = generate_feasible_samples(model, scaler)
+        except Exception:
+            pass
+
     fig = go.Figure()
+
+    # Feasible region (light blue)
+    if len(feat_api) > 0:
+        fig.add_trace(go.Scatter(
+            x=feat_api,
+            y=feat_efrf,
+            mode='markers',
+            name='Feasible region',
+            marker=dict(size=3, color='lightblue', opacity=0.4),
+            hovertemplate='API: %{x:.2f}%<br>EFRF: %{y:.3f}<extra></extra>',
+            showlegend=True
+        ))
+
+    # Sort by API for line
+    sort_idx = np.argsort(api_vals)
+    api_sorted = api_vals[sort_idx]
+    efrf_sorted = efrf_vals[sort_idx]
+
+    # Pareto front line + markers
     fig.add_trace(go.Scatter(
-        x=api_vals, y=efrf_vals,
-        mode='markers',
-        name='Pareto Solutions',
-        marker=dict(size=9, color='#a3c4f3', line=dict(width=1, color='#4a6fa5')),
+        x=api_sorted,
+        y=efrf_sorted,
+        mode='lines+markers',
+        name='Pareto Front',
+        line=dict(color='red', width=2),
+        marker=dict(size=8, color='#a3c4f3', line=dict(width=1, color='#4a6fa5')),
         hovertemplate='API: %{x:.2f}%<br>EFRF: %{y:.3f}<extra></extra>'
     ))
+
+    # Golden solution
     if golden:
         fig.add_trace(go.Scatter(
-            x=[golden['API (%)']], y=[golden['EFRF']],
+            x=[golden['API (%)']],
+            y=[golden['EFRF']],
             mode='markers',
-            name='🏆 Golden (Balanced) Solution',
+            name='🏆 Golden Solution',
             marker=dict(size=22, color='gold', symbol='star', line=dict(width=1.5, color='#8a6d00')),
             hovertemplate=f"<b>🏆 Golden Solution</b><br>API: {golden['API (%)']:.2f}%<br>EFRF: {golden['EFRF']:.3f}<extra></extra>"
         ))
+
+    # Tested formulation
     tested = st.session_state.get('results')
     if tested and 'api' in tested and 'efrf' in tested:
         fig.add_trace(go.Scatter(
-            x=[tested['api']], y=[tested['efrf']],
+            x=[tested['api']],
+            y=[tested['efrf']],
             mode='markers',
-            name='🔵 Tested Solution (current formulation)',
+            name='🔵 Tested Formulation',
             marker=dict(size=14, color='blue', symbol='circle', line=dict(width=1.5, color='white')),
-            hovertemplate=f"<b>Tested Solution</b><br>API: {tested['api']:.2f}%<br>EFRF: {tested['efrf']:.3f}<extra></extra>"
+            hovertemplate=f"<b>Tested Formulation</b><br>API: {tested['api']:.2f}%<br>EFRF: {tested['efrf']:.3f}<extra></extra>"
         ))
+
+    # Boundaries
+    fig.add_hline(y=0.40, line_dash='dash', line_color='gray', annotation_text='EFRF limit (0.40)')
+    fig.add_vline(x=API_MIN, line_dash='dash', line_color='gray', annotation_text=f'API min ({API_MIN}%)')
+    fig.add_vline(x=API_MAX, line_dash='dash', line_color='gray', annotation_text=f'API max ({API_MAX}%)')
+
     fig.update_layout(
         title=f'Pareto Front - Generation {gen_slider}',
         xaxis_title='API (%)',
@@ -1060,7 +1104,12 @@ def render_pareto_evolution():
         f"**Generation {gen_slider+1}/{NSGA_GENERATIONS}** · "
         f"Pareto-optimal solutions at this generation: {len(current_pop)}"
     )
+    if len(feat_api) > 0:
+        st.caption("Light blue points are random feasible formulations (all constraints satisfied).")
 
+# ================================================================
+# The remaining UI functions (unchanged from previous version)
+# ================================================================
 def render_golden_solution(golden):
     if not golden:
         return
@@ -1092,11 +1141,6 @@ def render_golden_solution(golden):
     flagged = {name: s for name, s in status_map.items()
               if "near limit" in s or "Below target" in s or "Exceeds limit" in s}
     if flagged:
-        # NEW (revised): previously named nothing specific ("at least one
-        # property") — now lists exactly which property(ies) are marginal
-        # or failing, and what kind of issue each one is, so the warning
-        # is directly actionable instead of requiring the reader to
-        # cross-reference the badges above themselves.
         details = "; ".join(f"**{name}** ({s.split(' ', 1)[1] if ' ' in s else s})" for name, s in flagged.items())
         st.warning(f"⚠️ This is the best available trade-off among the Pareto-optimal solutions found, "
                    f"but {details} — worth reviewing before committing to this formulation.")
