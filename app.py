@@ -1,7 +1,7 @@
 # ================================================================
 # Hybrid AI · Multi-Objective Tablet Optimization
 # Nile Valley University · Sudan · v29.28‑R32
-# VERSION 12 – GOLDEN ON PARETO LINE (CORRECT INDEX)
+# FINAL – GOLDEN ON PARETO LINE + HARD CONSTRAINTS
 # ================================================================
 
 import streamlit as st
@@ -30,7 +30,7 @@ st.set_page_config(
 )
 
 # ================================================================
-# CONSTANTS
+# CONSTANTS (Hard constraints – fixed)
 # ================================================================
 API_MIN, API_MAX = 80.0, 98.0
 BINDER_MIN, BINDER_MAX = 1.4, 6.0
@@ -171,7 +171,7 @@ class HybridTabletModel(nn.Module):
             return self.forward(x).numpy()
 
 # ================================================================
-# DATA GENERATION
+# DATA GENERATION (Physics‑based synthetic data)
 # ================================================================
 N_SAMPLES = 8000
 BOUNDARY_FRACTION = 0.30
@@ -247,8 +247,8 @@ class InputScaler:
 # ================================================================
 # CHECKPOINT PATHS AND TRAINING
 # ================================================================
-CHECKPOINT_SYNTHETIC = os.path.join(tempfile.gettempdir(), 'co_hybai_synthetic_v12.pt')
-CHECKPOINT_REAL = os.path.join(tempfile.gettempdir(), 'co_hybai_real_v12.pt')
+CHECKPOINT_SYNTHETIC = os.path.join(tempfile.gettempdir(), 'co_hybai_synthetic_v13.pt')
+CHECKPOINT_REAL = os.path.join(tempfile.gettempdir(), 'co_hybai_real_v13.pt')
 
 @st.cache_resource(show_spinner=False)
 def train_model(use_real=False, real_df=None):
@@ -376,7 +376,7 @@ def train_model(use_real=False, real_df=None):
     return model, scaler, history
 
 # ================================================================
-# NSGA-II OPTIMIZER – 2 OBJECTIVES
+# NSGA-II OPTIMIZER – 2 OBJECTIVES (with hard constraints)
 # ================================================================
 class NSGAIIOptimizer:
     def __init__(self, model, scaler, pop_size=50, generations=80, y_train_mean=None):
@@ -407,6 +407,7 @@ class NSGAIIOptimizer:
         density = pred[:, 0]
         tensile = pred[:, 1]
         efrf = pred[:, 2]
+        disintegration = pred[:, 3]
         api = pop[:, 0]
         
         # Out-of-distribution shrinkage
@@ -416,14 +417,25 @@ class NSGAIIOptimizer:
         density = shrink_factor * density + (1 - shrink_factor) * self.y_train_mean[0]
         tensile = shrink_factor * tensile + (1 - shrink_factor) * self.y_train_mean[1]
         efrf = shrink_factor * efrf + (1 - shrink_factor) * self.y_train_mean[2]
+        disintegration = shrink_factor * disintegration + (1 - shrink_factor) * self.y_train_mean[3]
         
+        # ---- Hard constraints -> violation (for constraint dominance) ----
+        violation = np.zeros(len(pop))
+        violation += np.maximum(0, 0.72 - density) + np.maximum(0, density - 0.99)
+        violation += np.maximum(0, 1.5 - tensile)
+        violation += np.maximum(0, efrf - 0.40)
+        violation += np.maximum(0, disintegration - 15.0)
+        mcc = pop[:, 1]
+        violation += np.maximum(0, 2.0 - mcc) + np.maximum(0, mcc - 8.0)
+        
+        # ---- Two objectives ----
         fitness = np.column_stack([
             -api,   # maximise API
             efrf    # minimise EFRF
         ])
-        return fitness
+        return fitness, violation
 
-    def fast_non_dominated_sort(self, obj):
+    def fast_non_dominated_sort(self, obj, violations):
         n = len(obj)
         dom_count = np.zeros(n, dtype=int)
         dom_sol = [[] for _ in range(n)]
@@ -432,9 +444,14 @@ class NSGAIIOptimizer:
             for j in range(n):
                 if i == j:
                     continue
-                if np.all(obj[i] <= obj[j]) and np.any(obj[i] < obj[j]):
+                # Constraint dominance: if j has lower violation, or both feasible and j dominates
+                if (violations[j] < violations[i]) or \
+                   (violations[j] == 0 and violations[i] == 0 and
+                    np.all(obj[j] <= obj[i]) and np.any(obj[j] < obj[i])):
                     dom_sol[i].append(j)
-                elif np.all(obj[j] <= obj[i]) and np.any(obj[j] < obj[i]):
+                elif (violations[i] < violations[j]) or \
+                     (violations[i] == 0 and violations[j] == 0 and
+                      np.all(obj[i] <= obj[j]) and np.any(obj[i] < obj[j])):
                     dom_count[i] += 1
             if dom_count[i] == 0:
                 first_front.append(i)
@@ -479,6 +496,7 @@ class NSGAIIOptimizer:
     ]
 
     def optimize(self, n_vars):
+        rng = np.random.default_rng()
         pop = np.random.rand(self.pop_size, n_vars)
         pop[:, 0] = pop[:, 0] * 18 + 80
         pop[:, 1] = pop[:, 1] * 4.6 + 1.4
@@ -489,10 +507,10 @@ class NSGAIIOptimizer:
         pop[:, 6] = pop[:, 6] * 100 + 150
         pop[:, 7] = pop[:, 7] * 15 + 15
         pop = self.enforce_mass_balance(pop)
-        obj = self.evaluate(pop)
+        obj, viol = self.evaluate(pop)
         history = []
         for gen in range(self.generations):
-            fronts = self.fast_non_dominated_sort(obj)
+            fronts = self.fast_non_dominated_sort(obj, viol)
             selected = []
             for _ in range(self.pop_size):
                 i1, i2 = np.random.choice(self.pop_size, 2, replace=False)
@@ -511,12 +529,12 @@ class NSGAIIOptimizer:
             for i in range(0, self.pop_size, 2):
                 p1 = sel_pop[i]
                 p2 = sel_pop[(i+1) % self.pop_size]
-                if np.random.random() < 0.8:
+                if rng.random() < 0.8:
                     c1 = np.zeros_like(p1)
                     c2 = np.zeros_like(p2)
                     for j in range(n_vars):
-                        if np.random.random() < 0.5:
-                            beta = 1.0 + 2.0 * np.random.random()
+                        if rng.random() < 0.5:
+                            beta = 1.0 + 2.0 * rng.random()
                             c1[j] = 0.5 * ((1+beta)*p1[j] + (1-beta)*p2[j])
                             c2[j] = 0.5 * ((1-beta)*p1[j] + (1+beta)*p2[j])
                         else:
@@ -526,19 +544,20 @@ class NSGAIIOptimizer:
                     c1 = p1.copy()
                     c2 = p2.copy()
                 for child in [c1, c2]:
-                    if np.random.random() < 0.1:
+                    if rng.random() < 0.1:
                         for j in range(n_vars):
-                            if np.random.random() < 0.1:
+                            if rng.random() < 0.1:
                                 lo, hi = self.GENE_BOUNDS[j]
                                 span = hi - lo
-                                child[j] = np.clip(child[j] + np.random.normal(0, 0.1) * span, lo, hi)
+                                child[j] = np.clip(child[j] + rng.normal(0, 0.1) * span, lo, hi)
                 offspring.extend([c1, c2])
             offspring = np.array(offspring[:self.pop_size])
             offspring = self.enforce_mass_balance(offspring)
-            off_obj = self.evaluate(offspring)
+            off_obj, off_viol = self.evaluate(offspring)
             combined_pop = np.vstack([pop, offspring])
             combined_obj = np.vstack([obj, off_obj])
-            combined_fronts = self.fast_non_dominated_sort(combined_obj)
+            combined_viol = np.concatenate([viol, off_viol])
+            combined_fronts = self.fast_non_dominated_sort(combined_obj, combined_viol)
             new_pop = []
             remaining = self.pop_size
             for front in combined_fronts:
@@ -551,8 +570,9 @@ class NSGAIIOptimizer:
                     break
             pop = combined_pop[new_pop]
             obj = combined_obj[new_pop]
+            viol = combined_viol[new_pop]
             if gen % 5 == 0 or gen == self.generations - 1:
-                fronts = self.fast_non_dominated_sort(obj)
+                fronts = self.fast_non_dominated_sort(obj, viol)
                 pareto_indices = fronts[0]
                 history.append({
                     'generation': gen,
@@ -565,7 +585,7 @@ class NSGAIIOptimizer:
             yield pop, obj, history, gen
 
 # ================================================================
-# RESULT FUNCTIONS (CORRECTED – stores original_idx)
+# RESULT FUNCTIONS
 # ================================================================
 def get_model_and_scaler():
     real_df = st.session_state.get('user_data')
@@ -600,10 +620,21 @@ def run_real_optimization(progress_callback=None):
         if progress_callback is not None:
             progress_callback(gen, NSGA_GENERATIONS)
 
-    fronts = optimizer.fast_non_dominated_sort(final_obj)
-    pareto_idx = fronts[0]
-    pareto_pop = final_pop[pareto_idx]
-    pareto_obj = final_obj[pareto_idx]
+    # Extract Pareto front (first front)
+    # We need to recompute the front from final_obj and zeros violation (all feasible)
+    # But we already have the front from the last generation's history.
+    # However, the history stores the front, so we can get the last front.
+    if gen_history:
+        last = gen_history[-1]
+        pareto_idx = last['pareto_indices']
+        pareto_pop = last['pareto_solutions']
+        pareto_obj = last['pareto_objectives']
+    else:
+        # fallback
+        fronts = optimizer.fast_non_dominated_sort(final_obj, np.zeros(len(final_pop)))
+        pareto_idx = fronts[0]
+        pareto_pop = final_pop[pareto_idx]
+        pareto_obj = final_obj[pareto_idx]
 
     preds = model.predict(scaler.transform(pareto_pop))
     solutions = []
@@ -619,14 +650,14 @@ def run_real_optimization(progress_callback=None):
             'Density': density, 'Tensile (MPa)': tensile, 'EFRF': efrf,
             'Disintegration (min)': pred[3], 'Dissolution (min)': pred[4],
             'Quality Score': quality['overall'],
-            'original_idx': i  # <-- store original index
+            'original_idx': i
         })
     solutions.sort(key=lambda x: x['Quality Score'], reverse=True)
     if not solutions:
         return [], None, gen_history
 
     golden = solutions[0]
-    golden_idx = golden['original_idx']  # <-- use the stored index
+    golden_idx = golden['original_idx']
 
     st.session_state.golden_idx = golden_idx
     st.session_state.golden_solution = golden
@@ -658,7 +689,7 @@ def get_current_formulation_results():
     }
 
 # ================================================================
-# UI RENDER FUNCTIONS (all unchanged – same as previous version)
+# UI RENDER FUNCTIONS
 # ================================================================
 def render_sidebar():
     with st.sidebar:
@@ -712,8 +743,10 @@ def render_sidebar():
         with st.expander("📊 Optimization Objectives", expanded=True):
             st.markdown("1. **Maximize API%** (objective)")
             st.markdown("2. **Minimize EFRF** (objective)")
-            st.markdown("3. **Tensile ≥ 1.5 MPa** (constraint)")
-            st.markdown("4. **Density** (only in quality score)")
+            st.markdown("3. **Tensile ≥ 1.5 MPa** (hard constraint)")
+            st.markdown("4. **Density 0.72–0.99** (hard constraint)")
+            st.markdown("5. **Disintegration ≤ 15 min** (hard constraint)")
+            st.markdown("6. **MCC 2–8%** (hard constraint)")
         with st.expander("⚙️ Algorithm Settings", expanded=False):
             st.markdown(f"**Population:** {POPULATION_SIZE}")
             st.markdown(f"**Generations:** {NSGA_GENERATIONS}")
@@ -1452,7 +1485,7 @@ def main():
             st.markdown("**📊 Two Objectives: API & EFRF**")
         with col2:
             st.markdown("**⚖️ Mass Balance Enforced**")
-            st.markdown("**🔬 Tensile as Constraint**")
+            st.markdown("**🔬 Hard Constraints**")
         with col3:
             st.markdown("**📈 Pareto Front with Feasible Region**")
             st.markdown("**🏆 Golden Solution**")
