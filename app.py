@@ -1,7 +1,7 @@
 # ================================================================
 # Hybrid AI · Multi-Objective Tablet Optimization
 # Nile Valley University · Sudan · v29.28‑R32
-# VERSION 10 – 2‑OBJECTIVE: API vs EFRF (Tensile as constraint)
+# VERSION 11 – 2‑OBJECTIVE: API vs EFRF + FEASIBLE REGION
 # ================================================================
 
 import streamlit as st
@@ -245,8 +245,8 @@ class InputScaler:
 # ================================================================
 # CHECKPOINT PATHS
 # ================================================================
-CHECKPOINT_SYNTHETIC = os.path.join(tempfile.gettempdir(), 'co_hybai_synthetic_v10.pt')
-CHECKPOINT_REAL = os.path.join(tempfile.gettempdir(), 'co_hybai_real_v10.pt')
+CHECKPOINT_SYNTHETIC = os.path.join(tempfile.gettempdir(), 'co_hybai_synthetic_v11.pt')
+CHECKPOINT_REAL = os.path.join(tempfile.gettempdir(), 'co_hybai_real_v11.pt')
 
 @st.cache_resource(show_spinner=False)
 def train_model(use_real=False, real_df=None):
@@ -923,6 +923,57 @@ def render_training_progress():
                 f"{history.get('n_val', '?')} held-out samples."
             )
 
+# --- Helper to generate feasible region samples ---
+def generate_feasible_samples(model, scaler, n_samples=3000):
+    """Generate random formulations, predict, and return those that satisfy all constraints."""
+    rng = np.random.default_rng(0)
+    # Sample uniformly within bounds
+    api = rng.uniform(API_MIN, API_MAX, n_samples)
+    binder = rng.uniform(BINDER_MIN, BINDER_MAX, n_samples)
+    pvpp = rng.uniform(PVPP_MIN, PVPP_MAX, n_samples)
+    mgst = rng.uniform(MGST_MIN, MGST_MAX, n_samples)
+    mcc = rng.uniform(MCC_MIN, MCC_MAX, n_samples)
+    moisture = rng.uniform(MOISTURE_MIN, MOISTURE_MAX, n_samples)
+    pressure = rng.uniform(PRESSURE_MIN, PRESSURE_MAX, n_samples)
+    speed = rng.uniform(SPEED_MIN, SPEED_MAX, n_samples)
+    
+    # Normalize compositions to 100% (mass balance)
+    # We'll do a quick mass balance: clip to bounds, rescale
+    comps = np.column_stack([api, binder, pvpp, mgst, mcc, moisture])
+    lo = np.array([API_MIN, BINDER_MIN, PVPP_MIN, MGST_MIN, MCC_MIN, MOISTURE_MIN])
+    hi = np.array([API_MAX, BINDER_MAX, PVPP_MAX, MGST_MAX, MCC_MAX, MOISTURE_MAX])
+    comps_clipped = np.clip(comps, lo, hi)
+    total = comps_clipped.sum(axis=1, keepdims=True)
+    total = np.where(total <= 0, 1.0, total)
+    norm = comps_clipped / total * 100.0
+    # Clip again after normalization (ensures bounds)
+    norm = np.clip(norm, lo, hi)
+    total2 = norm.sum(axis=1, keepdims=True)
+    total2 = np.where(total2 <= 0, 1.0, total2)
+    norm = norm * (100.0 / total2)
+    norm = np.clip(norm, lo, hi)  # final clip
+    
+    X = np.column_stack([norm, pressure, speed])
+    X_scaled = scaler.transform(X)
+    preds = model.predict(X_scaled)
+    
+    density = preds[:, 0]
+    tensile = preds[:, 1]
+    efrf = preds[:, 2]
+    disintegration = preds[:, 3]
+    
+    # Constraints
+    feasible_mask = (
+        (density >= 0.72) & (density <= 0.99) &
+        (tensile >= 1.5) &
+        (efrf < 0.40) &
+        (disintegration <= 15.0) &
+        (norm[:, 4] >= 2.0) & (norm[:, 4] <= 8.0)  # MCC
+    )
+    feasible_api = norm[feasible_mask, 0]
+    feasible_efrf = efrf[feasible_mask]
+    return feasible_api, feasible_efrf
+
 def render_pareto_evolution():
     st.markdown("---")
     st.markdown("## 🌐 Pareto Front Evolution")
@@ -957,31 +1008,57 @@ def render_pareto_evolution():
         dis_vals = preds[:, 3]
         diss_vals = preds[:, 4]
         density_vals = preds[:, 0]
+        # Also generate feasible region samples
+        feat_api, feat_efrf = generate_feasible_samples(model, scaler)
     else:
         dis_vals = np.full_like(api_vals, np.nan)
         diss_vals = np.full_like(api_vals, np.nan)
         density_vals = np.full_like(api_vals, np.nan)
+        feat_api, feat_efrf = np.array([]), np.array([])
 
     # Build figure based on type
     if plot_type == "API vs EFRF":
         x_label, y_label = "API (%)", "EFRF"
         x_vals, y_vals = api_vals, efrf_vals
+        feasible_x, feasible_y = feat_api, feat_efrf
     elif plot_type == "API vs Tensile":
         x_label, y_label = "API (%)", "Tensile (MPa)"
         x_vals, y_vals = api_vals, tensile_vals
+        feasible_x, feasible_y = None, None  # we only show feasible for EFRF plot
     elif plot_type == "API vs Disintegration":
         x_label, y_label = "API (%)", "Disintegration (min)"
         x_vals, y_vals = api_vals, dis_vals
+        feasible_x, feasible_y = None, None
     else:  # API vs Dissolution
         x_label, y_label = "API (%)", "Dissolution (min)"
         x_vals, y_vals = api_vals, diss_vals
+        feasible_x, feasible_y = None, None
 
     fig = go.Figure()
+
+    # ---- Feasible region background (only for API vs EFRF) ----
+    if plot_type == "API vs EFRF" and len(feasible_x) > 0:
+        fig.add_trace(go.Scatter(
+            x=feasible_x,
+            y=feasible_y,
+            mode='markers',
+            name='Feasible region (sampled)',
+            marker=dict(
+                size=3,
+                color='lightblue',
+                opacity=0.3,
+                line=dict(width=0)
+            ),
+            hovertemplate='API: %{x:.1f}%<br>EFRF: %{y:.3f}<extra></extra>',
+            showlegend=True
+        ))
+
+    # ---- Pareto front ----
     fig.add_trace(go.Scatter(
         x=x_vals,
         y=y_vals,
         mode='markers',
-        name='Pareto Solutions',
+        name='Pareto Front',
         marker=dict(
             size=8,
             color=api_vals,
@@ -997,8 +1074,8 @@ def render_pareto_evolution():
         customdata=np.column_stack([density_vals])
     ))
 
+    # ---- Golden solution ----
     if golden:
-        # Map golden values
         golden_x = golden['API (%)']
         if plot_type == "API vs EFRF":
             golden_y = golden['EFRF']
@@ -1017,6 +1094,12 @@ def render_pareto_evolution():
             hovertemplate=f'<b>Golden</b><br>{x_label}: %{{x:.3f}}<br>{y_label}: %{{y:.3f}}<extra></extra>'
         ))
 
+    # ---- Constraint boundaries ----
+    if plot_type == "API vs EFRF":
+        fig.add_hline(y=0.40, line_dash='dash', line_color='gray', annotation_text='EFRF threshold (0.40)')
+    fig.add_vline(x=API_MIN, line_dash='dot', line_color='gray', annotation_text=f'API min ({API_MIN}%)')
+    fig.add_vline(x=API_MAX, line_dash='dot', line_color='gray', annotation_text=f'API max ({API_MAX}%)')
+
     fig.update_layout(
         title=f'Pareto Front - Generation {gen_slider}',
         xaxis_title=x_label,
@@ -1031,6 +1114,11 @@ def render_pareto_evolution():
         f"**Generation {gen_slider+1}/{NSGA_GENERATIONS}** · "
         f"Pareto-optimal solutions at this generation: {len(current_pop)}"
     )
+    if plot_type == "API vs EFRF":
+        st.caption("Light blue points are randomly sampled feasible formulations (all constraints satisfied).")
+
+# --- The remaining UI functions (render_golden_solution, etc.) are unchanged from before ---
+# For brevity, I'll include them as they are exactly the same as in the previous version.
 
 def render_golden_solution(golden):
     if not golden:
@@ -1304,7 +1392,7 @@ def main():
             st.markdown("**⚖️ Mass Balance Enforced**")
             st.markdown("**🔬 Tensile as Constraint**")
         with col3:
-            st.markdown("**📈 Pareto Front**")
+            st.markdown("**📈 Pareto Front with Feasible Region**")
             st.markdown("**🏆 Golden Solution**")
 
 if __name__ == "__main__":
