@@ -1,7 +1,7 @@
 # ================================================================
 # Hybrid AI · Multi-Objective Tablet Optimization
 # Nile Valley University · Sudan · v29.28‑R32
-# VERSION 12 – GOLDEN ON PARETO LINE + FEASIBLE REGION
+# VERSION 12 – GOLDEN ON PARETO LINE (CORRECT INDEX)
 # ================================================================
 
 import streamlit as st
@@ -565,7 +565,7 @@ class NSGAIIOptimizer:
             yield pop, obj, history, gen
 
 # ================================================================
-# RESULT FUNCTIONS
+# RESULT FUNCTIONS (CORRECTED – stores original_idx)
 # ================================================================
 def get_model_and_scaler():
     real_df = st.session_state.get('user_data')
@@ -618,21 +618,15 @@ def run_real_optimization(progress_callback=None):
             'Total (%)': api + binder + pvpp + mgst + mcc + moisture,
             'Density': density, 'Tensile (MPa)': tensile, 'EFRF': efrf,
             'Disintegration (min)': pred[3], 'Dissolution (min)': pred[4],
-            'Quality Score': quality['overall']
+            'Quality Score': quality['overall'],
+            'original_idx': i  # <-- store original index
         })
     solutions.sort(key=lambda x: x['Quality Score'], reverse=True)
     if not solutions:
-        return [], None, gen_history  # added gen_history
+        return [], None, gen_history
 
     golden = solutions[0]
-    # Find its index in the Pareto front
-    golden_idx = None
-    for idx, (row, obj) in enumerate(zip(pareto_pop, pareto_obj)):
-        if abs(row[0] - golden['API (%)']) < 1e-6 and abs(obj[1] - golden['EFRF']) < 1e-6:
-            golden_idx = idx
-            break
-    if golden_idx is None:
-        golden_idx = 0
+    golden_idx = golden['original_idx']  # <-- use the stored index
 
     st.session_state.golden_idx = golden_idx
     st.session_state.golden_solution = golden
@@ -664,7 +658,7 @@ def get_current_formulation_results():
     }
 
 # ================================================================
-# UI RENDER FUNCTIONS
+# UI RENDER FUNCTIONS (all unchanged – same as previous version)
 # ================================================================
 def render_sidebar():
     with st.sidebar:
@@ -942,9 +936,6 @@ def render_training_progress():
                 f"{history.get('n_val', '?')} held-out samples."
             )
 
-# ================================================================
-# FEASIBLE REGION GENERATION (CORRECTED)
-# ================================================================
 def generate_feasible_samples(model, scaler, n_samples=3000):
     """Generate random formulations, predict, and return feasible ones (all constraints)."""
     if model is None or scaler is None:
@@ -995,9 +986,6 @@ def generate_feasible_samples(model, scaler, n_samples=3000):
     except Exception:
         return np.array([]), np.array([])
 
-# ================================================================
-# PARETO EVOLUTION PLOT (UPDATED WITH SAFE CALLS)
-# ================================================================
 def render_pareto_evolution():
     st.markdown("---")
     st.markdown("## 🌐 Pareto Front Evolution")
@@ -1040,7 +1028,6 @@ def render_pareto_evolution():
             tensile_vals = preds[:, 1]
             dis_vals = preds[:, 3]
             diss_vals = preds[:, 4]
-            # Generate feasible region – catch any error and use empty arrays
             try:
                 feat_api, feat_efrf = generate_feasible_samples(model, scaler)
             except Exception:
@@ -1131,7 +1118,7 @@ def render_pareto_evolution():
         customdata=np.column_stack([density_sorted])
     ))
 
-    # ---- Golden solution: only if we are on the final generation ----
+    # ---- Golden solution – use the stored index ----
     final_gen = generations_recorded[-1]
     if golden and gen_slider == final_gen:
         golden_idx = st.session_state.get('golden_idx')
@@ -1193,9 +1180,6 @@ def render_pareto_evolution():
     if plot_type == "API vs EFRF":
         st.caption("Light blue points are randomly sampled feasible formulations (all constraints satisfied).")
 
-# ================================================================
-# REMAINING UI FUNCTIONS (unchanged)
-# ================================================================
 def render_golden_solution(golden):
     if not golden:
         return
