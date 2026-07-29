@@ -1,7 +1,7 @@
 # ================================================================
 # Hybrid AI · Multi-Objective Tablet Optimization
 # Nile Valley University · Sudan · v29.28‑R32
-# VERSION 8 – REAL DATA UPLOAD + SYNTHETIC FALLBACK
+# VERSION 8 – REAL DATA UPLOAD + PARETO PLOT IMPROVEMENTS
 # ================================================================
 
 import streamlit as st
@@ -30,7 +30,7 @@ st.set_page_config(
 )
 
 # ================================================================
-# CONSTANTS
+# CONSTANTS (same as before)
 # ================================================================
 API_MIN, API_MAX = 80.0, 98.0
 BINDER_MIN, BINDER_MAX = 1.4, 6.0
@@ -74,7 +74,8 @@ def initialize_session_state():
         'results': None, 'best_solutions': None, 'golden_solution': None,
         'runtime': 0, 'pareto_history': None,
         'user_data': None, 'data_source': 'synthetic',
-        'force_retrain': False
+        'force_retrain': False,
+        'pareto_plot_type': '3D (Density, Tensile, EFRF)'  # new
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -82,7 +83,7 @@ def initialize_session_state():
 initialize_session_state()
 
 # ================================================================
-# HELPER FUNCTIONS
+# HELPER FUNCTIONS (unchanged)
 # ================================================================
 def normalize_formulation(api, binder, pvpp, mgst, mcc, moisture):
     comps = np.array([api, binder, pvpp, mgst, mcc, moisture])
@@ -125,7 +126,7 @@ def calculate_quality_score(density, tensile, efrf, api=None):
                 'weights': weights}
 
 # ================================================================
-# HYBRID NEURAL NETWORK (Physics‑Informed)
+# HYBRID NEURAL NETWORK (unchanged)
 # ================================================================
 class HybridTabletModel(nn.Module):
     def __init__(self, input_dim=8, hidden_dim=256):
@@ -168,7 +169,7 @@ class HybridTabletModel(nn.Module):
             return self.forward(x).numpy()
 
 # ================================================================
-# SYNTHETIC DATASET GENERATION
+# DATA GENERATION (unchanged)
 # ================================================================
 N_SAMPLES = 8000
 BOUNDARY_FRACTION = 0.30
@@ -242,19 +243,16 @@ class InputScaler:
         return (X - self.mean_) / self.std_
 
 # ================================================================
-# CHECKPOINT PATHS (one for synthetic, one for real data)
+# CHECKPOINT PATHS
 # ================================================================
 CHECKPOINT_SYNTHETIC = os.path.join(tempfile.gettempdir(), 'co_hybai_synthetic_v8.pt')
 CHECKPOINT_REAL = os.path.join(tempfile.gettempdir(), 'co_hybai_real_v8.pt')
 
 @st.cache_resource(show_spinner=False)
 def train_model(use_real=False, real_df=None):
-    """Train or load a cached model. If use_real=True and real_df is provided,
-    train on real data. Otherwise, fall back to synthetic data."""
-    
+    """Train or load a cached model."""
     checkpoint_path = CHECKPOINT_REAL if use_real and real_df is not None else CHECKPOINT_SYNTHETIC
     
-    # Try to load from checkpoint
     if os.path.exists(checkpoint_path):
         try:
             ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
@@ -264,21 +262,19 @@ def train_model(use_real=False, real_df=None):
             scaler = ckpt['scaler']
             history = ckpt['history']
             history['data_source'] = ckpt.get('data_source', 'unknown')
-            # Store data source in session state
             st.session_state.data_source = history.get('data_source', 'unknown')
             return model, scaler, history
         except Exception as e:
             st.warning(f"Checkpoint load failed: {e}. Retraining...")
     
-    # Prepare data
     if use_real and real_df is not None:
         required_cols = ['API','Binder','PVPP','MgSt','MCC','Moisture','Pressure','Speed',
                          'Density','Tensile','EFRF','Disintegration','Dissolution']
         missing = [c for c in required_cols if c not in real_df.columns]
         if missing:
             raise ValueError(f"Missing columns: {missing}")
-        X = real_df[['API','Binder','PVPP','MgSt','MCC','Moisture','Pressure','Speed']].values.astype(np.float32)
-        y = real_df[['Density','Tensile','EFRF','Disintegration','Dissolution']].values.astype(np.float32)
+        X = real_df[required_cols[:8]].values.astype(np.float32)
+        y = real_df[required_cols[8:]].values.astype(np.float32)
         data_source = 'real'
         st.session_state.data_source = 'real'
     else:
@@ -379,7 +375,7 @@ def train_model(use_real=False, real_df=None):
     return model, scaler, history
 
 # ================================================================
-# NSGA-II OPTIMIZER
+# NSGA-II OPTIMIZER (unchanged)
 # ================================================================
 class NSGAIIOptimizer:
     def __init__(self, model, scaler, pop_size=50, generations=80, y_train_mean=None):
@@ -419,20 +415,13 @@ class NSGAIIOptimizer:
         tensile = shrink_factor * tensile + (1 - shrink_factor) * self.y_train_mean[1]
         efrf = shrink_factor * efrf + (1 - shrink_factor) * self.y_train_mean[2]
         
-        fitness = np.column_stack([
-            -density,
-            -tensile,
-            efrf
-        ])
-        
+        fitness = np.column_stack([-density, -tensile, efrf])
         api_norm = np.clip((api - 80) / 18, 0.0, 1.0)
         tensile_norm = np.clip(tensile / 8.5, 0.0, 1.0)
         penalty_api = 0.08 * (1 - api_norm)
         penalty_tensile = 0.05 * (1 - tensile_norm)
-        
         fitness[:, 0] += penalty_api
         fitness[:, 1] += penalty_tensile
-        
         return fitness
 
     def fast_non_dominated_sort(self, obj):
@@ -580,7 +569,6 @@ class NSGAIIOptimizer:
 # RESULT FUNCTIONS
 # ================================================================
 def get_model_and_scaler():
-    """Return the model, scaler, and history for the current data source."""
     real_df = st.session_state.get('user_data')
     use_real = real_df is not None and len(real_df) > 0
     return train_model(use_real=use_real, real_df=real_df)
@@ -657,7 +645,7 @@ def get_current_formulation_results():
     }
 
 # ================================================================
-# UI RENDER FUNCTIONS
+# UI RENDER FUNCTIONS (modified)
 # ================================================================
 def render_sidebar():
     with st.sidebar:
@@ -668,7 +656,6 @@ def render_sidebar():
         st.markdown(f"**Department:** Pharmaceutical Engineering")
         st.markdown("---")
         
-        # --- Data Source Section ---
         st.markdown("### 📂 Data Source")
         uploaded_file = st.file_uploader(
             "Upload your dataset (CSV)",
@@ -684,22 +671,18 @@ def render_sidebar():
                 if not missing:
                     st.session_state.user_data = df
                     st.success(f"✅ Loaded {len(df)} samples")
-                    # Force retrain on next run
                     st.session_state.force_retrain = True
                 else:
                     st.error(f"Missing columns: {missing}")
             except Exception as e:
                 st.error(f"Error reading file: {e}")
         else:
-            # If no file uploaded, show current data source
             if st.session_state.data_source == 'real':
                 st.info(f"🔵 Using real data ({len(st.session_state.get('user_data', []))} samples)")
             else:
                 st.info("🟢 Using synthetic data (fallback)")
         
-        # --- Force Retrain Button ---
-        if st.button("🔄 Force Retrain", use_container_width=True,
-                     help="Discard cached model and retrain on current data source."):
+        if st.button("🔄 Force Retrain", use_container_width=True):
             for checkpoint in [CHECKPOINT_SYNTHETIC, CHECKPOINT_REAL]:
                 if os.path.exists(checkpoint):
                     try:
@@ -731,8 +714,7 @@ def render_sidebar():
         
         col_a, col_b = st.columns(2)
         with col_a:
-            if st.button("↺ Reset Sliders", use_container_width=True,
-                        help="Restore all formulation and process parameters to their default values."):
+            if st.button("↺ Reset Sliders", use_container_width=True):
                 defaults = {
                     'api': 96.5, 'binder': 1.4, 'pvpp': 1.0, 'mgst': 0.10,
                     'mcc': 1.5, 'moisture': 0.50, 'binder_grade': 0,
@@ -820,32 +802,24 @@ def render_input_panel():
     st.info("⚠️ Components will be automatically normalized to sum to 100%.")
     col1, col2 = st.columns(2)
     with col1:
-        st.session_state.api = st.slider("**API Content (%)**", API_MIN, API_MAX, st.session_state.api, step=0.5,
-                                         help="Active pharmaceutical ingredient loading. Higher API is usually harder to compress well.")
-        st.session_state.binder = st.slider("**Binder (%)**", BINDER_MIN, BINDER_MAX, st.session_state.binder, step=0.1,
-                                            help="Improves particle-particle bonding and tensile strength.")
-        st.session_state.pvpp = st.slider("**PVPP (%)**", PVPP_MIN, PVPP_MAX, st.session_state.pvpp, step=0.1,
-                                          help="Disintegrant — helps the tablet break apart in the body.")
-        st.session_state.mgst = st.slider("**MgSt (%)**", MGST_MIN, MGST_MAX, st.session_state.mgst, step=0.05,
-                                          help="Lubricant — eases tablet ejection but can weaken bonding at high levels.")
+        st.session_state.api = st.slider("**API Content (%)**", API_MIN, API_MAX, st.session_state.api, step=0.5)
+        st.session_state.binder = st.slider("**Binder (%)**", BINDER_MIN, BINDER_MAX, st.session_state.binder, step=0.1)
+        st.session_state.pvpp = st.slider("**PVPP (%)**", PVPP_MIN, PVPP_MAX, st.session_state.pvpp, step=0.1)
+        st.session_state.mgst = st.slider("**MgSt (%)**", MGST_MIN, MGST_MAX, st.session_state.mgst, step=0.05)
     with col2:
-        st.session_state.mcc = st.slider("**MCC (%)**", MCC_MIN, MCC_MAX, st.session_state.mcc, step=0.1,
-                                         help="Microcrystalline cellulose filler/binder — supports compressibility.")
-        st.session_state.moisture = st.slider("**Moisture Content (%)**", MOISTURE_MIN, MOISTURE_MAX, st.session_state.moisture, step=0.1,
-                                              help="Residual moisture in the powder blend.")
+        st.session_state.mcc = st.slider("**MCC (%)**", MCC_MIN, MCC_MAX, st.session_state.mcc, step=0.1)
+        st.session_state.moisture = st.slider("**Moisture Content (%)**", MOISTURE_MIN, MOISTURE_MAX, st.session_state.moisture, step=0.1)
         grade_idx = st.session_state.get('binder_grade', 0)
         if not isinstance(grade_idx, int) or grade_idx >= len(BINDER_GRADE_NAMES):
             grade_idx = 0
-        selected = st.selectbox("**Binder Grade**", BINDER_GRADE_NAMES, index=grade_idx,
-                                help="Reference properties shown below for context. Not yet a model input.")
+        selected = st.selectbox("**Binder Grade**", BINDER_GRADE_NAMES, index=grade_idx)
         st.session_state.binder_grade = BINDER_GRADE_NAMES.index(selected)
         props = BINDER_GRADES[selected]
         st.caption(f"🔍 **{selected} Properties:**")
         st.caption(f"• Compressibility: {props['compressibility']:.0%}")
         st.caption(f"• Disintegration: {props['disintegration']:.0%}")
         st.caption(f"• Flowability: {props['flow']:.0%}")
-        st.session_state.particle_size = st.slider("**Particle Size (µm)**", PARTICLE_SIZE_MIN, PARTICLE_SIZE_MAX, st.session_state.particle_size, step=5.0,
-                                                    help="Reference value only — see the note under Process Parameters.")
+        st.session_state.particle_size = st.slider("**Particle Size (µm)**", PARTICLE_SIZE_MIN, PARTICLE_SIZE_MAX, st.session_state.particle_size, step=5.0)
     render_mass_balance_display(
         st.session_state.api, st.session_state.binder,
         st.session_state.pvpp, st.session_state.mgst,
@@ -853,25 +827,16 @@ def render_input_panel():
     )
     st.markdown("---")
     st.markdown("## ⚙️ Process Parameters")
-    st.caption("ℹ️ Only **Compression Pressure** and **Tableting Speed** currently feed into the model's "
-              "predictions. The other process parameters below (granule size, dwell time, friction, "
-              "decompression time) and Binder Grade/Particle Size above are recorded for your reference "
-              "but are not yet part of the trained model's input space.")
+    st.caption("ℹ️ Only **Compression Pressure** and **Tableting Speed** currently feed into the model's predictions.")
     col3, col4 = st.columns(2)
     with col3:
-        st.session_state.pressure = st.slider("**Compression Pressure (MPa)**", PRESSURE_MIN, PRESSURE_MAX, st.session_state.pressure, step=2.0,
-                                              help="Higher pressure generally increases density and tensile strength. Used by the model.")
-        st.session_state.speed = st.slider("**Tableting Speed (rpm)**", SPEED_MIN, SPEED_MAX, st.session_state.speed, step=0.5,
-                                           help="Turret speed. Used by the model.")
-        st.session_state.granule = st.slider("**Granule Size (µm)**", GRANULE_MIN, GRANULE_MAX, st.session_state.granule, step=5.0,
-                                             help="Reference value only — not yet a model input.")
+        st.session_state.pressure = st.slider("**Compression Pressure (MPa)**", PRESSURE_MIN, PRESSURE_MAX, st.session_state.pressure, step=2.0)
+        st.session_state.speed = st.slider("**Tableting Speed (rpm)**", SPEED_MIN, SPEED_MAX, st.session_state.speed, step=0.5)
+        st.session_state.granule = st.slider("**Granule Size (µm)**", GRANULE_MIN, GRANULE_MAX, st.session_state.granule, step=5.0)
     with col4:
-        st.session_state.dwell_time = st.slider("**Dwell Time (ms)**", DWELL_TIME_MIN, DWELL_TIME_MAX, st.session_state.dwell_time, step=1.0,
-                                                help="Reference value only — not yet a model input.")
-        st.session_state.friction = st.slider("**Friction Coefficient**", FRICTION_MIN, FRICTION_MAX, st.session_state.friction, step=0.01,
-                                              help="Reference value only — not yet a model input.")
-        st.session_state.decompression_time = st.slider("**Decompression Time (ms)**", DECOMPRESSION_TIME_MIN, DECOMPRESSION_TIME_MAX, st.session_state.decompression_time, step=2.0,
-                                                         help="Reference value only — not yet a model input.")
+        st.session_state.dwell_time = st.slider("**Dwell Time (ms)**", DWELL_TIME_MIN, DWELL_TIME_MAX, st.session_state.dwell_time, step=1.0)
+        st.session_state.friction = st.slider("**Friction Coefficient**", FRICTION_MIN, FRICTION_MAX, st.session_state.friction, step=0.01)
+        st.session_state.decompression_time = st.slider("**Decompression Time (ms)**", DECOMPRESSION_TIME_MIN, DECOMPRESSION_TIME_MAX, st.session_state.decompression_time, step=2.0)
 
 def target_status(value, threshold, mode='min', comfortable=None):
     if mode == 'min':
@@ -927,7 +892,6 @@ def render_training_progress():
         st.warning("No training history available.")
         return
     
-    # Show data source info
     data_source = history.get('data_source', 'unknown')
     st.info(f"📊 Model trained on: **{data_source.upper()}** data ({history.get('n_samples', '?')} samples)")
     
@@ -957,11 +921,46 @@ def render_training_progress():
             st.dataframe(diag_df, hide_index=True, use_container_width=True)
             st.caption(
                 f"Trained on {history.get('n_train', '?')} samples, validated on "
-                f"{history.get('n_val', '?')} held-out samples. A property with poor fit here means "
-                "the optimizer's predictions for it (and any formulation the search converges to that "
-                "relies on it) are less trustworthy — treat Pareto-optimal points as candidates for "
-                "experimental confirmation, not as guaranteed outcomes."
+                f"{history.get('n_val', '?')} held-out samples."
             )
+
+# --- NEW PLOTTING FUNCTIONS ---
+def plot_2d_pareto(x_vals, y_vals, x_label, y_label, api_vals, golden=None, title="Pareto Front", colorbar_title="API%"):
+    """Create a 2D scatter plot with color mapping for API."""
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=x_vals,
+        y=y_vals,
+        mode='markers',
+        name='Pareto Solutions',
+        marker=dict(
+            size=8,
+            color=api_vals,
+            colorscale='Viridis',
+            showscale=True,
+            colorbar=dict(title=colorbar_title, x=1.02),
+            line=dict(width=1, color='black')
+        ),
+        hovertemplate=f'{x_label}: %{{x:.3f}}<br>{y_label}: %{{y:.3f}}<br>API: %{{marker.color:.1f}}%<extra></extra>'
+    ))
+    if golden:
+        fig.add_trace(go.Scatter(
+            x=[golden[x_label]],
+            y=[golden[y_label]],
+            mode='markers',
+            name='🏆 Golden Solution',
+            marker=dict(size=15, color='red', symbol='diamond', line=dict(width=2, color='white')),
+            hovertemplate=f'<b>Golden</b><br>{x_label}: %{{x:.3f}}<br>{y_label}: %{{y:.3f}}<extra></extra>'
+        ))
+    fig.update_layout(
+        title=title,
+        xaxis_title=x_label,
+        yaxis_title=y_label,
+        height=500,
+        template='plotly_white',
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    return fig
 
 def render_pareto_evolution():
     st.markdown("---")
@@ -971,70 +970,155 @@ def render_pareto_evolution():
     if not pareto_history:
         st.info("Run the optimization to see the real Pareto front evolve across generations.")
         return
+
+    # Plot type selector
+    plot_type = st.radio(
+        "Select plot type",
+        options=["API vs EFRF", "API vs Tensile", "API vs Density", "3D (Density, Tensile, EFRF)"],
+        index=0,
+        horizontal=True,
+        key="pareto_plot_type"
+    )
+
     generations_recorded = [h['generation'] for h in pareto_history]
-    chart = st.empty()
     gen_slider = st.select_slider("Select generation to view", options=generations_recorded, value=generations_recorded[-1])
     current_entry = next(h for h in pareto_history if h['generation'] == gen_slider)
     current_obj = current_entry['pareto_objectives']
-    current_density = -current_obj[:, 0]
-    current_tensile = -current_obj[:, 1]
-    current_efrf = current_obj[:, 2]
-    current_api = current_entry['pareto_solutions'][:, 0]
+    current_pop = current_entry['pareto_solutions']
+    
+    # Extract data
+    api_vals = current_pop[:, 0]
+    density_vals = -current_obj[:, 0]
+    tensile_vals = -current_obj[:, 1]
+    efrf_vals = current_obj[:, 2]
 
-    fig = go.Figure()
-    for i, h in enumerate(pareto_history):
-        if h['generation'] >= gen_slider:
-            continue
-        obj = h['pareto_objectives']
-        alpha = 0.1 + 0.2 * (i / max(1, len(pareto_history)))
-        fig.add_trace(go.Scatter3d(
-            x=-obj[:, 0], y=-obj[:, 1], z=obj[:, 2],
-            mode='markers',
-            marker=dict(size=4, opacity=alpha, color='lightgray'),
-            name=f"Gen {h['generation']}", showlegend=False,
-            hovertemplate='Density: %{x:.3f}<br>Tensile: %{y:.2f} MPa<br>EFRF: %{z:.3f}<extra></extra>'
-        ))
-    fig.add_trace(go.Scatter3d(
-        x=current_density, y=current_tensile, z=current_efrf,
-        mode='markers',
-        marker=dict(
-            size=8,
-            color=current_api,
-            colorscale='Viridis',
-            showscale=True,
-            colorbar=dict(title="API%", x=1.02, len=0.6),
-            opacity=0.9,
-            line=dict(width=1, color='black')
-        ),
-        name=f'Generation {gen_slider}',
-        hovertemplate='Density: %{x:.3f}<br>Tensile: %{y:.2f} MPa<br>EFRF: %{z:.3f}<br>API: %{marker.color:.1f}%<extra></extra>'
-    ))
+    # Prepare golden data if exists
+    golden_data = None
     if golden:
+        # Find golden in the current pop? Actually golden is from final solutions, but we can plot its values.
+        golden_data = {
+            'API (%)': golden['API (%)'],
+            'Density': golden['Density'],
+            'Tensile (MPa)': golden['Tensile (MPa)'],
+            'EFRF': golden['EFRF']
+        }
+        # We need to map keys to plot labels
+        # We'll just use the golden dictionary directly.
+
+    # Build figure based on type
+    if plot_type == "3D (Density, Tensile, EFRF)":
+        fig = go.Figure()
+        # Add historical generations as faint traces
+        for i, h in enumerate(pareto_history):
+            if h['generation'] >= gen_slider:
+                continue
+            obj = h['pareto_objectives']
+            alpha = 0.1 + 0.2 * (i / max(1, len(pareto_history)))
+            fig.add_trace(go.Scatter3d(
+                x=-obj[:, 0], y=-obj[:, 1], z=obj[:, 2],
+                mode='markers',
+                marker=dict(size=4, opacity=alpha, color='lightgray'),
+                name=f"Gen {h['generation']}", showlegend=False,
+                hovertemplate='Density: %{x:.3f}<br>Tensile: %{y:.2f} MPa<br>EFRF: %{z:.3f}<extra></extra>'
+            ))
+        # Current front
         fig.add_trace(go.Scatter3d(
-            x=[golden['Density']], y=[golden['Tensile (MPa)']], z=[golden['EFRF']],
+            x=density_vals, y=tensile_vals, z=efrf_vals,
             mode='markers',
-            marker=dict(size=15, color='red', symbol='diamond', line=dict(width=2, color='white')),
-            name='🏆 Golden Solution',
-            hovertemplate='<b>🏆 GOLDEN SOLUTION</b><br>API: %{text}<br>Density: %{x:.3f}<br>Tensile: %{y:.2f} MPa<br>EFRF: %{z:.3f}<extra></extra>',
-            text=[f"{golden['API (%)']:.1f}%"]
+            marker=dict(
+                size=8,
+                color=api_vals,
+                colorscale='Viridis',
+                showscale=True,
+                colorbar=dict(title="API%", x=1.02, len=0.6),
+                opacity=0.9,
+                line=dict(width=1, color='black')
+            ),
+            name=f'Generation {gen_slider}',
+            hovertemplate='Density: %{x:.3f}<br>Tensile: %{y:.2f} MPa<br>EFRF: %{z:.3f}<br>API: %{marker.color:.1f}%<extra></extra>'
         ))
-    fig.update_layout(
-        title=f'Pareto Front Evolution - Generation {gen_slider} (color = API%)',
-        scene=dict(
-            xaxis=dict(title='Density', range=[0.55,0.95]),
-            yaxis=dict(title='Tensile Strength (MPa)', range=[0.5,8.5]),
-            zaxis=dict(title='EFRF', range=[0,1]),
-            camera=dict(eye=dict(x=1.8, y=1.8, z=1.8))
-        ),
-        height=550, margin=dict(l=0, r=0, t=50, b=0),
-        plot_bgcolor='rgba(0,0,0,0)',
-        paper_bgcolor='rgba(0,0,0,0)',
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-    )
-    chart.plotly_chart(fig, use_container_width=True)
+        if golden:
+            fig.add_trace(go.Scatter3d(
+                x=[golden['Density']], y=[golden['Tensile (MPa)']], z=[golden['EFRF']],
+                mode='markers',
+                marker=dict(size=15, color='red', symbol='diamond', line=dict(width=2, color='white')),
+                name='🏆 Golden Solution',
+                hovertemplate='<b>🏆 GOLDEN SOLUTION</b><br>API: %{text}<br>Density: %{x:.3f}<br>Tensile: %{y:.2f} MPa<br>EFRF: %{z:.3f}<extra></extra>',
+                text=[f"{golden['API (%)']:.1f}%"]
+            ))
+        fig.update_layout(
+            title=f'Pareto Front Evolution - Generation {gen_slider} (color = API%)',
+            scene=dict(
+                xaxis=dict(title='Density', range=[0.55,0.95]),
+                yaxis=dict(title='Tensile Strength (MPa)', range=[0.5,8.5]),
+                zaxis=dict(title='EFRF', range=[0,1]),
+                camera=dict(eye=dict(x=1.8, y=1.8, z=1.8))
+            ),
+            height=550,
+            margin=dict(l=0, r=0, t=50, b=0)
+        )
+    else:
+        # 2D plots
+        if plot_type == "API vs EFRF":
+            x_label = "API (%)"
+            y_label = "EFRF"
+            x_vals = api_vals
+            y_vals = efrf_vals
+            golden_x = golden_data['API (%)'] if golden_data else None
+            golden_y = golden_data['EFRF'] if golden_data else None
+        elif plot_type == "API vs Tensile":
+            x_label = "API (%)"
+            y_label = "Tensile (MPa)"
+            x_vals = api_vals
+            y_vals = tensile_vals
+            golden_x = golden_data['API (%)'] if golden_data else None
+            golden_y = golden_data['Tensile (MPa)'] if golden_data else None
+        else:  # API vs Density
+            x_label = "API (%)"
+            y_label = "Density"
+            x_vals = api_vals
+            y_vals = density_vals
+            golden_x = golden_data['API (%)'] if golden_data else None
+            golden_y = golden_data['Density'] if golden_data else None
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=x_vals,
+            y=y_vals,
+            mode='markers',
+            name='Pareto Solutions',
+            marker=dict(
+                size=8,
+                color=api_vals,
+                colorscale='Viridis',
+                showscale=True,
+                colorbar=dict(title="API%", x=1.02),
+                line=dict(width=1, color='black')
+            ),
+            hovertemplate=f'{x_label}: %{{x:.3f}}<br>{y_label}: %{{y:.3f}}<br>API: %{{marker.color:.1f}}%<extra></extra>'
+        ))
+        if golden_data and golden_x is not None:
+            fig.add_trace(go.Scatter(
+                x=[golden_x],
+                y=[golden_y],
+                mode='markers',
+                name='🏆 Golden Solution',
+                marker=dict(size=15, color='red', symbol='diamond', line=dict(width=2, color='white')),
+                hovertemplate=f'<b>Golden</b><br>{x_label}: %{{x:.3f}}<br>{y_label}: %{{y:.3f}}<extra></extra>'
+            ))
+        fig.update_layout(
+            title=f'Pareto Front - Generation {gen_slider}',
+            xaxis_title=x_label,
+            yaxis_title=y_label,
+            height=500,
+            template='plotly_white',
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+
+    st.plotly_chart(fig, use_container_width=True)
     st.caption(
         f"**Generation {gen_slider+1}/{NSGA_GENERATIONS}** · "
-        f"Pareto-optimal solutions at this generation: {len(current_density)}"
+        f"Pareto-optimal solutions at this generation: {len(current_pop)}"
     )
 
 def render_golden_solution(golden):
