@@ -75,7 +75,6 @@ def initialize_session_state():
         'runtime': 0, 'pareto_history': None,
         'user_data': None, 'data_source': 'synthetic',
         'force_retrain': False,
-        'pareto_plot_type': '3D (Density, Tensile, EFRF)'  # new
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -677,6 +676,7 @@ def get_current_formulation_results():
                      st.session_state.pressure, st.session_state.speed]], dtype=np.float32)
     pred = model.predict(scaler.transform(row))[0]
     return {
+        'api': float(n['api']),
         'density': float(pred[0]), 'tensile': float(pred[1]), 'efrf': float(pred[2]),
         'disintegration': float(pred[3]), 'dissolution': float(pred[4])
     }
@@ -997,158 +997,63 @@ def render_training_progress():
                 f"{history.get('n_val', '?')} held-out samples."
             )
 
-# --- NEW PLOTTING FUNCTIONS ---
-def plot_2d_pareto(x_vals, y_vals, x_label, y_label, api_vals, golden=None, title="Pareto Front", colorbar_title="API%"):
-    """Create a 2D scatter plot with color mapping for API."""
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=x_vals,
-        y=y_vals,
-        mode='markers',
-        name='Pareto Solutions',
-        marker=dict(
-            size=8,
-            color=api_vals,
-            colorscale='Viridis',
-            showscale=True,
-            colorbar=dict(title=colorbar_title, x=1.02),
-            line=dict(width=1, color='black')
-        ),
-        hovertemplate=f'{x_label}: %{{x:.3f}}<br>{y_label}: %{{y:.3f}}<br>API: %{{marker.color:.1f}}%<extra></extra>'
-    ))
-    if golden:
-        fig.add_trace(go.Scatter(
-            x=[golden[x_label]],
-            y=[golden[y_label]],
-            mode='markers',
-            name='🏆 Golden Solution',
-            marker=dict(size=15, color='red', symbol='diamond', line=dict(width=2, color='white')),
-            hovertemplate=f'<b>Golden</b><br>{x_label}: %{{x:.3f}}<br>{y_label}: %{{y:.3f}}<extra></extra>'
-        ))
-    fig.update_layout(
-        title=title,
-        xaxis_title=x_label,
-        yaxis_title=y_label,
-        height=500,
-        template='plotly_white',
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-    )
-    return fig
-
 def render_pareto_evolution():
     st.markdown("---")
-    st.markdown("## 🌐 Pareto Front Evolution")
+    st.markdown("## 🌐 Pareto Front Evolution: API% vs EFRF")
     golden = st.session_state.get('golden_solution', None)
     pareto_history = st.session_state.get('pareto_history', None)
     if not pareto_history:
         st.info("Run the optimization to see the real Pareto front evolve across generations.")
         return
 
-    # Plot type selector
-    plot_type = st.radio(
-        "Select plot type",
-        options=["API vs EFRF", "API vs Tensile", "API vs Density", "3D (Density, Tensile, EFRF)"],
-        index=0,
-        horizontal=True,
-        key="pareto_plot_type"
-    )
-
     generations_recorded = [h['generation'] for h in pareto_history]
     gen_slider = st.select_slider("Select generation to view", options=generations_recorded, value=generations_recorded[-1])
     current_entry = next(h for h in pareto_history if h['generation'] == gen_slider)
     current_obj = current_entry['pareto_objectives']
     current_pop = current_entry['pareto_solutions']
-    
+
     # Extract data
     api_vals = current_pop[:, 0]
-    density_vals = -current_obj[:, 0]
-    tensile_vals = -current_obj[:, 1]
     efrf_vals = current_obj[:, 2]
 
-    # Prepare golden data if exists
-    golden_data = None
+    # NEW: locked to a single API% (x) vs EFRF (y) view, with the golden
+    # solution marked as a gold star and the formulation currently on the
+    # sliders (from Quick Predict / the last optimization run) marked as a
+    # blue circle, so the two reference points requested are always
+    # visible on the same chart instead of requiring a plot-type switch.
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=api_vals, y=efrf_vals,
+        mode='markers',
+        name='Pareto Solutions',
+        marker=dict(size=9, color='#a3c4f3', line=dict(width=1, color='#4a6fa5')),
+        hovertemplate='API: %{x:.2f}%<br>EFRF: %{y:.3f}<extra></extra>'
+    ))
     if golden:
-        # Find golden in the current pop? Actually golden is from final solutions, but we can plot its values.
-        golden_data = {
-            'API (%)': golden['API (%)'],
-            'Density': golden['Density'],
-            'Tensile (MPa)': golden['Tensile (MPa)'],
-            'EFRF': golden['EFRF']
-        }
-        # We need to map keys to plot labels
-        # We'll just use the golden dictionary directly.
-
-    # Build figure based on type
-    if plot_type == "3D (Density, Tensile, EFRF)":
-        fig = go.Figure()
-        # Add historical generations as faint traces
-        for i, h in enumerate(pareto_history):
-            if h['generation'] >= gen_slider:
-                continue
-            obj = h['pareto_objectives']
-            alpha = 0.1 + 0.2 * (i / max(1, len(pareto_history)))
-            fig.add_trace(go.Scatter3d(
-                x=-obj[:, 0], y=-obj[:, 1], z=obj[:, 2],
-                mode='markers',
-                marker=dict(size=4, opacity=alpha, color='lightgray'),
-                name=f"Gen {h['generation']}", showlegend=False,
-                hovertemplate='Density: %{x:.3f}<br>Tensile: %{y:.2f} MPa<br>EFRF: %{z:.3f}<extra></extra>'
-            ))
-        # Current front
-        fig.add_trace(go.Scatter3d(
-            x=density_vals, y=tensile_vals, z=efrf_vals,
+        fig.add_trace(go.Scatter(
+            x=[golden['API (%)']], y=[golden['EFRF']],
             mode='markers',
-            marker=dict(
-                size=8,
-                color=api_vals,
-                colorscale='Viridis',
-                showscale=True,
-                colorbar=dict(title="API%", x=1.02, len=0.6),
-                opacity=0.9,
-                line=dict(width=1, color='black')
-            ),
-            name=f'Generation {gen_slider}',
-            hovertemplate='Density: %{x:.3f}<br>Tensile: %{y:.2f} MPa<br>EFRF: %{z:.3f}<br>API: %{marker.color:.1f}%<extra></extra>'
+            name='🏆 Golden (Balanced) Solution',
+            marker=dict(size=22, color='gold', symbol='star', line=dict(width=1.5, color='#8a6d00')),
+            hovertemplate=f"<b>🏆 Golden Solution</b><br>API: {golden['API (%)']:.2f}%<br>EFRF: {golden['EFRF']:.3f}<extra></extra>"
         ))
-        if golden:
-            fig.add_trace(go.Scatter3d(
-                x=[golden['Density']], y=[golden['Tensile (MPa)']], z=[golden['EFRF']],
-                mode='markers',
-                marker=dict(size=15, color='red', symbol='diamond', line=dict(width=2, color='white')),
-                name='🏆 Golden Solution',
-                hovertemplate='<b>🏆 GOLDEN SOLUTION</b><br>API: %{text}<br>Density: %{x:.3f}<br>Tensile: %{y:.2f} MPa<br>EFRF: %{z:.3f}<extra></extra>',
-                text=[f"{golden['API (%)']:.1f}%"]
-            ))
-        fig.update_layout(
-            title=f'Pareto Front Evolution - Generation {gen_slider} (color = API%)',
-            scene=dict(
-                xaxis=dict(title='Density', range=[0.55,0.95]),
-                yaxis=dict(title='Tensile Strength (MPa)', range=[0.5,8.5]),
-                zaxis=dict(title='EFRF', range=[0,1]),
-                camera=dict(eye=dict(x=1.8, y=1.8, z=1.8))
-            ),
-            height=550,
-            margin=dict(l=0, r=0, t=50, b=0)
-        )
-    else:
-        # 2D plots
-        # NEW: this branch previously reimplemented go.Figure() construction
-        # inline, fully duplicating the plot_2d_pareto() helper defined
-        # above it — which was written but never actually called anywhere.
-        # Now calls that helper directly instead of maintaining two copies
-        # of the same plotting logic.
-        if plot_type == "API vs EFRF":
-            x_label, y_label = "API (%)", "EFRF"
-            x_vals, y_vals = api_vals, efrf_vals
-        elif plot_type == "API vs Tensile":
-            x_label, y_label = "API (%)", "Tensile (MPa)"
-            x_vals, y_vals = api_vals, tensile_vals
-        else:  # API vs Density
-            x_label, y_label = "API (%)", "Density"
-            x_vals, y_vals = api_vals, density_vals
-
-        fig = plot_2d_pareto(x_vals, y_vals, x_label, y_label, api_vals,
-                             golden=golden_data, title=f'Pareto Front - Generation {gen_slider}')
+    tested = st.session_state.get('results')
+    if tested and 'api' in tested and 'efrf' in tested:
+        fig.add_trace(go.Scatter(
+            x=[tested['api']], y=[tested['efrf']],
+            mode='markers',
+            name='🔵 Tested Solution (current formulation)',
+            marker=dict(size=14, color='blue', symbol='circle', line=dict(width=1.5, color='white')),
+            hovertemplate=f"<b>Tested Solution</b><br>API: {tested['api']:.2f}%<br>EFRF: {tested['efrf']:.3f}<extra></extra>"
+        ))
+    fig.update_layout(
+        title=f'Pareto Front - Generation {gen_slider}',
+        xaxis_title='API (%)',
+        yaxis_title='EFRF',
+        height=500,
+        template='plotly_white',
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
 
     st.plotly_chart(fig, use_container_width=True)
     st.caption(
