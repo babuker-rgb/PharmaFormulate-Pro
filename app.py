@@ -1,11 +1,11 @@
 # ================================================================
-# Hybrid AI v30.2-R32 · 
-# Multi-Objective Tablet Optimization
+# Hybrid AI v30.3-R32 · FINAL FIXED VERSION
+# Multi-Objective Tablet Optimization (BatchNorm Fix + Early Stopping)
 # ================================================================
 
 import streamlit as st
 import numpy as np
-import pandas as pd  # Important for type checking
+import pandas as pd
 import torch
 import torch.nn as nn
 import plotly.graph_objects as go
@@ -23,7 +23,7 @@ warnings.filterwarnings('ignore')
 # ================================================================
 # PAGE CONFIG & CONSTANTS
 # ================================================================
-st.set_page_config(page_title="Hybrid AI v30.2", page_icon="🧬", layout="wide")
+st.set_page_config(page_title="Hybrid AI v30.3", page_icon="🧬", layout="wide")
 
 API_MIN, API_MAX = 80.0, 98.0
 BINDER_MIN, BINDER_MAX = 1.4, 6.0
@@ -38,11 +38,12 @@ EFRF_THRESHOLD = 0.40
 POPULATION_SIZE = 80
 NSGA_GENERATIONS = 80
 TRAINING_EPOCHS = 2000
+EARLY_STOPPING_PATIENCE = 100  # Added Early Stopping
 HIDDEN_SIZE = 512
 N_SAMPLES = 10000
 
 # ================================================================
-# 1. DATA GENERATION (A to Z)
+# 1. DATA GENERATION
 # ================================================================
 def generate_synthetic_data(n_samples=N_SAMPLES, seed=42):
     rng = np.random.default_rng(seed)
@@ -57,7 +58,6 @@ def generate_synthetic_data(n_samples=N_SAMPLES, seed=42):
 
     X = np.column_stack([api, binder, pvpp, mgst, mcc, moisture, pressure, speed]).astype(np.float32)
 
-    # Simulate Physics
     density = np.clip(0.6 + 0.3 * ((pressure - 150) / 100) - 0.01 * (binder - 3.0) + rng.normal(0, 0.01, n_samples), 0.55, 0.95)
     tensile = np.clip(1.0 + 6.0 * (density - 0.55) + 0.2 * (api - 80) / 18 - 0.5 * (mgst - 0.1) + rng.normal(0, 0.2, n_samples), 0.5, 8.5)
     efrf = np.clip(0.6 - 0.5 * (density - 0.55) + 0.2 * (mgst - 0.1) + rng.normal(0, 0.05, n_samples), 0.02, 0.98)
@@ -68,7 +68,7 @@ def generate_synthetic_data(n_samples=N_SAMPLES, seed=42):
     return X, y
 
 # ================================================================
-# 2. SCALER & PINN MODEL
+# 2. SCALER & PINN MODEL (FIXED BATCHNORM UNCERTAINTY)
 # ================================================================
 class InputScaler:
     def fit(self, X):
@@ -117,14 +117,24 @@ class HybridTabletModel(nn.Module):
         return torch.stack([density, tensile, efrf, disintegration, dissolution], dim=1)
 
     def predict_with_uncertainty(self, x, n_samples=20):
-        self.train()
+        """
+        Fix for BatchNorm with Batch Size 1 during Uncertainty calculation.
+        Repeats the input sample multiple times to ensure BatchNorm behaves correctly.
+        """
+        self.train() # Enable Dropout
         with torch.no_grad():
-            preds = np.array([self.forward(x).numpy() for _ in range(n_samples)])
+            if not torch.is_tensor(x):
+                x = torch.tensor(x, dtype=torch.float32)
+            # Repeat the single input N times to avoid BatchNorm Single-value error
+            x_repeat = x.repeat(n_samples, 1)
+            preds = self.forward(x_repeat).numpy()
+            # Reshape to (N_samples, 1, Features) to calculate stats properly
+            preds = preds.reshape(n_samples, -1, preds.shape[1])
         self.eval()
         return np.mean(preds, axis=0), np.std(preds, axis=0)
 
 # ================================================================
-# 3. ADVANCED OPTIMIZER (WITH FIXES FOR EVALUATION)
+# 3. ADVANCED OPTIMIZER (SOFTENED PENALTY)
 # ================================================================
 class AdvancedOptimizer:
     def __init__(self, model, scaler, pop_size=80, generations=80, y_train_mean=None):
@@ -151,15 +161,12 @@ class AdvancedOptimizer:
         return balanced
 
     def evaluate(self, pop):
-        # FIX 1: Ensure input is numpy array and not a pandas object
         pop_scaled = self.scaler.transform(pop)
         if isinstance(pop_scaled, pd.DataFrame):
             pop_scaled = pop_scaled.values
         
-        # FIX 2: Set model to eval mode and disable gradient tracking
         self.model.eval()
         with torch.no_grad():
-            # Use torch.tensor with explicit float32 for clarity
             pred = self.model(torch.tensor(pop_scaled, dtype=torch.float32)).numpy()
         
         density, tensile, efrf = pred[:, 0], pred[:, 1], pred[:, 2]
@@ -172,8 +179,8 @@ class AdvancedOptimizer:
         # Objectives (Density, Tensile, API to maximize; EFRF to minimize)
         fitness = np.column_stack([-density * penalty, -tensile * penalty, -pop[:, 0] * penalty, efrf * penalty])
         
-        # Hard Constraint on EFRF (high penalty if violated)
-        efrf_violation = np.maximum(0, efrf - EFRF_THRESHOLD) * 100.0
+        # Softened Hard Constraint on EFRF (Reduced from 100.0 to 20.0)
+        efrf_violation = np.maximum(0, efrf - EFRF_THRESHOLD) * 20.0
         fitness[:, 3] += efrf_violation
         return fitness
 
@@ -220,7 +227,6 @@ class AdvancedOptimizer:
             # Environmental Selection (Elitism)
             combined = np.vstack([pop, offspring])
             combined_obj = np.vstack([obj, self.evaluate(offspring)])
-            # Sort by sum of objectives and take top N
             pareto_indices = np.argsort(combined_obj.sum(axis=1))[:self.pop_size]
             pop = combined[pareto_indices]
             obj = combined_obj[pareto_indices]
@@ -230,7 +236,7 @@ class AdvancedOptimizer:
             yield pop, obj, history, gen
 
 # ================================================================
-# 4. ADVANCED TRAINING LOOP
+# 4. ADVANCED TRAINING LOOP (WITH EARLY STOPPING)
 # ================================================================
 CHECKPOINT_PATH = os.path.join(tempfile.gettempdir(), 'hybrid_ai_v30.pt')
 
@@ -261,6 +267,9 @@ def train_model():
         return (((pred - true) ** 2) / target_var).mean()
     
     history = {'loss': [], 'r2': []}
+    best_loss = np.inf
+    patience_counter = 0
+    
     for epoch in range(TRAINING_EPOCHS):
         model.train()
         optimizer.zero_grad()
@@ -278,6 +287,15 @@ def train_model():
                 ss_res = ((y_t - model(X_t)) ** 2).sum(dim=0)
                 ss_tot = ((y_t - y_t.mean(dim=0)) ** 2).sum(dim=0)
                 history['r2'].append((1 - ss_res / torch.clamp(ss_tot, min=1e-8)).mean().item())
+                
+                # Early Stopping Implementation
+                if val_loss < best_loss:
+                    best_loss = val_loss
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    if patience_counter >= EARLY_STOPPING_PATIENCE:
+                        break
     
     model.eval()
     torch.save({
@@ -336,19 +354,16 @@ def render_dynamic_radar(solutions_df, selected_solutions):
 # 6. MAIN APPLICATION
 # ================================================================
 def main():
-    st.title("🧬 Hybrid AI v30.2-R32 · Complete Framework (Fixed)")
+    st.title("🧬 Hybrid AI v30.3-R32 · Advanced EA (Adaptive Mutation)")
     
-    # Load resources
     with st.spinner("Loading Physics-Informed Model..."):
         model, scaler, history = train_model()
     
-    # Sidebar Recommender
     st.sidebar.header("⚖️ Custom Recommender")
     w_api = st.sidebar.slider("Weight for API", 0.0, 1.0, 0.4)
     w_quality = st.sidebar.slider("Weight for Quality", 0.0, 1.0, 0.6)
     st.sidebar.info("The system will prioritize solutions matching your preferences.")
 
-    # Main Layout
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("⚙️ Formulation & Process")
@@ -364,7 +379,7 @@ def main():
 
     if st.button("🚀 Run Advanced Optimization"):
         start_time = time.time()
-        with st.status("Running Advanced NSGA-II...", expanded=True) as status:
+        with st.status("Running Hybrid Advanced EA (NSGA-II + Adaptive Mutation)...", expanded=True) as status:
             progress_bar = st.progress(0)
             optimizer = AdvancedOptimizer(model, scaler, pop_size=POPULATION_SIZE, generations=NSGA_GENERATIONS, y_train_mean=history.get('y_train_mean'))
             
@@ -377,11 +392,6 @@ def main():
             
             status.update(label="Optimization Complete ✅", state="complete")
         
-        # Process results
-        y_train_mean = history.get('y_train_mean')
-        if y_train_mean is None: y_train_mean = [0.75, 4.5, 0.5, 20.0, 45.0]
-        
-        # Find best based on User Weights
         weights = np.array([w_api, w_quality])
         results = []
         for i in range(len(final_pop)):
@@ -392,7 +402,6 @@ def main():
         golden_idx = np.argmax(results)
         best_sol = final_pop[golden_idx]
         
-        # Prediction with Uncertainty
         pop_scaled = scaler.transform([best_sol])
         preds, uncertainty = model.predict_with_uncertainty(torch.tensor(pop_scaled, dtype=torch.float32))
         preds, uncertainty = preds[0], uncertainty[0]
@@ -400,11 +409,9 @@ def main():
         st.success(f"🏆 Golden Solution Found!\nAPI: {best_sol[0]:.2f}% | EFRF: {preds[2]:.3f} ± {uncertainty[2]:.3f}")
         st.caption(f"Optimization took {time.time() - start_time:.2f} seconds.")
         
-        # 3D Pareto
         st.subheader("🌐 3D Pareto Front (API - EFRF - Tensile)")
         render_3d_pareto(final_pop, final_obj, golden_idx)
         
-        # Sensitivity Analysis
         with st.expander("🔬 Sensitivity Analysis (Local)"):
             sens_data = perform_sensitivity_analysis(model, scaler, best_sol)
             if sens_data:
@@ -412,7 +419,6 @@ def main():
             else:
                 st.warning("Could not compute local sensitivity.")
         
-        # Top 5 Solutions & Dynamic Radar
         sol_list = []
         sorted_indices = np.argsort([-results[i] for i in range(len(final_pop))])
         for idx in sorted_indices[:10]:
@@ -434,7 +440,6 @@ def main():
             st.subheader("📊 Dynamic Radar Comparison")
             render_dynamic_radar(sol_df, selected)
         
-        # Export Report
         report = {
             'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             'golden_api': best_sol[0], 'golden_efrf': preds[2],
