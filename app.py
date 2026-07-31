@@ -273,6 +273,15 @@ def train_model(use_real=False, _real_df=None, data_fingerprint=None):
             return model, scaler, history
         except Exception as e:
             st.warning(f"Checkpoint load failed: {e}. Retraining...")
+            # BUGFIX: previously left the corrupted file in place — it
+            # would fail to load (and print this same warning) on every
+            # subsequent call until a fresh successful save happened to
+            # overwrite it. Removing it now means only the first attempt
+            # after corruption pays this cost.
+            try:
+                os.remove(checkpoint_path)
+            except OSError:
+                pass
     
     if use_real and _real_df is not None:
         required_cols = ['API','Binder','PVPP','MgSt','MCC','Moisture','Pressure','Speed',
@@ -372,12 +381,26 @@ def train_model(use_real=False, _real_df=None, data_fingerprint=None):
     history['y_train_mean'] = y_train_t.mean(dim=0).numpy().tolist()
     history['n_samples'] = len(X)
     
+    # BUGFIX: torch.save() previously wrote directly to checkpoint_path.
+    # That write is NOT atomic — if the process is interrupted partway
+    # through (a Streamlit rerun triggered by a slider change, another
+    # session/tab sharing this same fixed path on a shared server, a
+    # deploy restart, etc.), the file on disk is left truncated. The next
+    # attempt to load it then fails with exactly the reported error
+    # ("PytorchStreamReader failed locating file data.pkl... file not
+    # found"), since torch can't parse a half-written archive. Fixed by
+    # writing to a temp file in the same directory first, then using
+    # os.replace() — which is atomic on POSIX and Windows — to move it
+    # into place. A reader can now only ever see either the complete old
+    # checkpoint or the complete new one, never a partial file.
+    tmp_path = checkpoint_path + f'.tmp{os.getpid()}'
     torch.save({
         'model_state': model.state_dict(),
         'scaler': scaler,
         'history': history,
         'data_source': data_source
-    }, checkpoint_path)
+    }, tmp_path)
+    os.replace(tmp_path, checkpoint_path)
     
     return model, scaler, history
 
