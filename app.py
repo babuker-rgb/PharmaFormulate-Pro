@@ -1,7 +1,7 @@
 # ================================================================
 # Hybrid AI · Multi-Objective Tablet Optimization
 # Nile Valley University · Sudan · v29.28‑R32
-# FINAL – GOLDEN ALWAYS ON PARETO CURVE
+# VERSION 13 – POP=80, R²>0.95, GOLDEN ON CURVE
 # ================================================================
 
 import streamlit as st
@@ -30,7 +30,7 @@ st.set_page_config(
 )
 
 # ================================================================
-# CONSTANTS
+# CONSTANTS (improved)
 # ================================================================
 API_MIN, API_MAX = 80.0, 98.0
 BINDER_MIN, BINDER_MAX = 1.4, 6.0
@@ -57,9 +57,13 @@ BINDER_GRADES = {
 }
 BINDER_GRADE_NAMES = list(BINDER_GRADES.keys())
 
-POPULATION_SIZE = 50
-NSGA_GENERATIONS = 80
-TRAINING_EPOCHS = 1200
+# Improved NSGA‑II parameters
+POPULATION_SIZE = 80
+NSGA_GENERATIONS = 120
+# Improved training parameters
+TRAINING_EPOCHS = 2000
+HIDDEN_SIZE = 512
+EARLY_STOPPING_PATIENCE = 80
 
 # ================================================================
 # SESSION STATE
@@ -127,10 +131,10 @@ def calculate_quality_score(density, tensile, efrf, api=None):
                 'weights': weights}
 
 # ================================================================
-# HYBRID NEURAL NETWORK
+# HYBRID NEURAL NETWORK (larger)
 # ================================================================
 class HybridTabletModel(nn.Module):
-    def __init__(self, input_dim=8, hidden_dim=256):
+    def __init__(self, input_dim=8, hidden_dim=HIDDEN_SIZE):
         super().__init__()
         self.fc1 = nn.Linear(input_dim, hidden_dim)
         self.bn1 = nn.BatchNorm1d(hidden_dim)
@@ -140,7 +144,9 @@ class HybridTabletModel(nn.Module):
         self.bn3 = nn.BatchNorm1d(hidden_dim)
         self.fc4 = nn.Linear(hidden_dim, hidden_dim)
         self.bn4 = nn.BatchNorm1d(hidden_dim)
-        self.fc5 = nn.Linear(hidden_dim, 5)
+        self.fc5 = nn.Linear(hidden_dim, hidden_dim)
+        self.bn5 = nn.BatchNorm1d(hidden_dim)
+        self.fc6 = nn.Linear(hidden_dim, 5)
         self._initialize_weights()
     def _initialize_weights(self):
         for m in self.modules():
@@ -153,7 +159,8 @@ class HybridTabletModel(nn.Module):
         h2 = torch.relu(self.bn2(self.fc2(h1))) + h1
         h3 = torch.relu(self.bn3(self.fc3(h2))) + h2
         h4 = torch.relu(self.bn4(self.fc4(h3))) + h3
-        out = self.fc5(h4)
+        h5 = torch.relu(self.bn5(self.fc5(h4))) + h4
+        out = self.fc6(h5)
         density = torch.sigmoid(out[:, 0]) * 0.4 + 0.55
         tensile = torch.sigmoid(out[:, 1]) * 8.0 + 0.5
         efrf = torch.sigmoid(out[:, 2])
@@ -246,7 +253,7 @@ class InputScaler:
 # ================================================================
 # CHECKPOINT PATHS
 # ================================================================
-CHECKPOINT_SYNTHETIC = os.path.join(tempfile.gettempdir(), 'co_hybai_synthetic_v11.pt')
+CHECKPOINT_SYNTHETIC = os.path.join(tempfile.gettempdir(), 'co_hybai_synthetic_v13.pt')
 
 def _data_fingerprint(df):
     try:
@@ -265,7 +272,7 @@ def train_model(use_real=False, _real_df=None, data_fingerprint=None):
     if os.path.exists(checkpoint_path):
         try:
             ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-            model = HybridTabletModel(input_dim=8, hidden_dim=256)
+            model = HybridTabletModel(input_dim=8, hidden_dim=HIDDEN_SIZE)
             model.load_state_dict(ckpt['model_state'])
             model.eval()
             scaler = ckpt['scaler']
@@ -303,7 +310,7 @@ def train_model(use_real=False, _real_df=None, data_fingerprint=None):
     X_val_t = torch.tensor(X_scaled[val_idx], dtype=torch.float32)
     y_val_t = torch.tensor(y[val_idx], dtype=torch.float32)
     
-    model = HybridTabletModel(input_dim=8, hidden_dim=256)
+    model = HybridTabletModel(input_dim=8, hidden_dim=HIDDEN_SIZE)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=30, factor=0.5)
     
@@ -317,7 +324,7 @@ def train_model(use_real=False, _real_df=None, data_fingerprint=None):
     history = {'loss': [], 'r2': [], 'rmse': [], 'data_source': data_source}
     best_val_loss = np.inf
     best_state = None
-    patience, patience_counter = 60, 0
+    patience, patience_counter = EARLY_STOPPING_PATIENCE, 0
     
     for epoch in range(TRAINING_EPOCHS):
         model.train()
@@ -384,10 +391,10 @@ def train_model(use_real=False, _real_df=None, data_fingerprint=None):
     return model, scaler, history
 
 # ================================================================
-# NSGA-II OPTIMIZER (unchanged)
+# NSGA-II OPTIMIZER
 # ================================================================
 class NSGAIIOptimizer:
-    def __init__(self, model, scaler, pop_size=50, generations=80, y_train_mean=None):
+    def __init__(self, model, scaler, pop_size=POPULATION_SIZE, generations=NSGA_GENERATIONS, y_train_mean=None):
         self.model = model
         self.scaler = scaler
         self.pop_size = pop_size
@@ -600,7 +607,9 @@ def run_real_optimization(progress_callback=None):
         st.session_state['_trained_scaler'] = scaler
         st.session_state['_trained_history'] = history
 
-    optimizer = NSGAIIOptimizer(model, scaler, pop_size=POPULATION_SIZE, generations=NSGA_GENERATIONS,
+    optimizer = NSGAIIOptimizer(model, scaler,
+                                pop_size=POPULATION_SIZE,
+                                generations=NSGA_GENERATIONS,
                                 y_train_mean=history.get('y_train_mean'))
     gen_history = []
     final_pop, final_obj = None, None
@@ -1025,7 +1034,6 @@ def generate_feasible_samples(model, scaler, n_samples=3000):
     except Exception:
         return np.array([]), np.array([])
 
-# ---- FIXED PARETO PLOT ----
 def render_pareto_evolution():
     st.markdown("---")
     st.markdown("## 🌐 Pareto Front Evolution: API% vs EFRF")
@@ -1154,7 +1162,7 @@ def render_pareto_evolution():
         st.caption("Light blue points are random feasible formulations (all constraints satisfied).")
 
 # ================================================================
-# REMAINING UI FUNCTIONS (unchanged)
+# REMAINING UI FUNCTIONS
 # ================================================================
 def render_golden_solution(golden):
     if not golden:
