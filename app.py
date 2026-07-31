@@ -1,7 +1,7 @@
 # ================================================================
 # Hybrid AI · Multi-Objective Tablet Optimization
 # Nile Valley University · Sudan · v29.28‑R32
-# FINAL – POP=80, GENS=120, GOLDEN ON CURVE
+# FINAL – EXTENDED PARETO FRONT & IMPROVED TRAINING
 # ================================================================
 
 import streamlit as st
@@ -10,6 +10,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import time
 import warnings
 import json
@@ -30,7 +31,7 @@ st.set_page_config(
 )
 
 # ================================================================
-# CONSTANTS (improved)
+# CONSTANTS (improved training)
 # ================================================================
 API_MIN, API_MAX = 80.0, 98.0
 BINDER_MIN, BINDER_MAX = 1.4, 6.0
@@ -60,11 +61,12 @@ BINDER_GRADE_NAMES = list(BINDER_GRADES.keys())
 # NSGA‑II parameters
 POPULATION_SIZE = 80
 NSGA_GENERATIONS = 120
-# Model parameters
-TRAINING_EPOCHS = 2000
+
+# Training parameters (improved)
+TRAINING_EPOCHS = 3000
+EARLY_STOPPING_PATIENCE = 120
 HIDDEN_SIZE = 512
-EARLY_STOPPING_PATIENCE = 80
-N_SAMPLES = 8000  # increase to 15000 for R² >0.95
+N_SAMPLES = 15000
 
 # ================================================================
 # SESSION STATE
@@ -178,7 +180,7 @@ class HybridTabletModel(nn.Module):
             return self.forward(x).numpy()
 
 # ================================================================
-# DATA GENERATION
+# DATA GENERATION (larger dataset)
 # ================================================================
 def _sample_compositions(n_samples, rng, boundary_fraction=0.30):
     bounds = [(API_MIN, API_MAX), (BINDER_MIN, BINDER_MAX), (PVPP_MIN, PVPP_MAX),
@@ -251,7 +253,7 @@ class InputScaler:
 # ================================================================
 # CHECKPOINT PATHS
 # ================================================================
-CHECKPOINT_SYNTHETIC = os.path.join(tempfile.gettempdir(), 'co_hybai_final.pt')
+CHECKPOINT_SYNTHETIC = os.path.join(tempfile.gettempdir(), 'co_hybai_final_ext.pt')
 
 def _data_fingerprint(df):
     try:
@@ -1060,6 +1062,11 @@ def render_pareto_evolution():
     else:
         cummax_efrf = efrf_sorted
 
+    # Extension to EFRF = 0.40 (if max EFRF < 0.40)
+    max_api = api_sorted[-1] if len(api_sorted) > 0 else API_MIN
+    max_efrf = efrf_sorted[-1] if len(efrf_sorted) > 0 else 0.0
+    extend_to_limit = max_efrf < 0.40 and len(api_sorted) > 0
+
     model = st.session_state.get('_trained_model')
     scaler = st.session_state.get('_trained_scaler')
     feat_api, feat_efrf = np.array([]), np.array([])
@@ -1074,6 +1081,17 @@ def render_pareto_evolution():
 
     fig = go.Figure()
 
+    # Shade the non-optimal region (EFRF > 0.40)
+    fig.add_shape(
+        type="rect",
+        x0=API_MIN, x1=API_MAX,
+        y0=0.40, y1=1.0,
+        fillcolor="lightgray",
+        opacity=0.3,
+        line_width=0,
+        layer="below"
+    )
+
     if show_feasible and len(feat_api) > 0:
         fig.add_trace(go.Scatter(
             x=feat_api,
@@ -1085,6 +1103,7 @@ def render_pareto_evolution():
             showlegend=True
         ))
 
+    # Main Pareto front
     fig.add_trace(go.Scatter(
         x=api_sorted,
         y=cummax_efrf,
@@ -1094,6 +1113,28 @@ def render_pareto_evolution():
         marker=dict(size=8, color='#a3c4f3', line=dict(width=1, color='#4a6fa5')),
         hovertemplate='API: %{x:.2f}%<br>EFRF: %{y:.3f}<extra></extra>'
     ))
+
+    # Extension to 0.40 (dashed line)
+    if extend_to_limit:
+        fig.add_trace(go.Scatter(
+            x=[max_api, max_api],
+            y=[max_efrf, 0.40],
+            mode='lines',
+            name='Front extension to limit',
+            line=dict(color='red', width=2, dash='dash'),
+            showlegend=True,
+            hovertemplate='API: %{x:.2f}%<br>EFRF: %{y:.3f}<extra></extra>'
+        ))
+        # Also add a point at 0.40 to show the boundary
+        fig.add_trace(go.Scatter(
+            x=[max_api],
+            y=[0.40],
+            mode='markers',
+            marker=dict(size=8, color='red', symbol='cross'),
+            name='EFRF limit point',
+            hovertemplate=f'API: {max_api:.2f}%<br>EFRF: 0.40<extra></extra>',
+            showlegend=True
+        ))
 
     final_gen = generations_recorded[-1]
     if golden and gen_slider == final_gen:
