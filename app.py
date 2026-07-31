@@ -1356,6 +1356,18 @@ def main():
 
         st.success(f"⏱️ Optimization completed in {st.session_state.runtime} seconds!")
         st.balloons()
+        # BUGFIX: render_sidebar() runs at the very top of main(), before
+        # st.session_state.runtime is updated (a few lines above, deep
+        # inside this same block) — so the sidebar's "Runtime" metric was
+        # always showing the *previous* run's value (or 0/"Pending" on the
+        # first run), one run behind whatever the Optimization Summary and
+        # this success message report. A rerun here re-executes main() from
+        # the top with runtime already set, so the sidebar picks up the
+        # correct value. Since the model and results are already cached in
+        # session state, this rerun re-enters the `elif
+        # optimization_complete` branch below and redraws instantly — it
+        # does not retrain or re-run NSGA-II.
+        st.rerun()
 
     elif st.session_state.optimization_complete and st.session_state.results:
         render_results_summary(st.session_state.results)
