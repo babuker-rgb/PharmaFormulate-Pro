@@ -1,7 +1,7 @@
 # ================================================================
 # Hybrid AI · Multi-Objective Tablet Optimization
 # Nile Valley University · Sudan · v29.28‑R32
-# FINAL – SMOOTH PARETO, FEASIBLE REGION TOGGLE, GOLDEN ON CURVE
+# FINAL – GOLDEN ALWAYS ON PARETO CURVE
 # ================================================================
 
 import streamlit as st
@@ -72,6 +72,7 @@ def initialize_session_state():
         'granule': 125.0, 'dwell_time': 25.0, 'friction': 0.25,
         'decompression_time': 35.0, 'optimization_complete': False,
         'results': None, 'best_solutions': None, 'golden_solution': None,
+        'golden_idx': None,
         'runtime': 0, 'pareto_history': None,
         'user_data': None, 'data_source': 'synthetic',
         'force_retrain': False,
@@ -245,7 +246,7 @@ class InputScaler:
 # ================================================================
 # CHECKPOINT PATHS
 # ================================================================
-CHECKPOINT_SYNTHETIC = os.path.join(tempfile.gettempdir(), 'co_hybai_synthetic_v10.pt')
+CHECKPOINT_SYNTHETIC = os.path.join(tempfile.gettempdir(), 'co_hybai_synthetic_v11.pt')
 
 def _data_fingerprint(df):
     try:
@@ -383,7 +384,7 @@ def train_model(use_real=False, _real_df=None, data_fingerprint=None):
     return model, scaler, history
 
 # ================================================================
-# NSGA-II OPTIMIZER
+# NSGA-II OPTIMIZER (unchanged)
 # ================================================================
 class NSGAIIOptimizer:
     def __init__(self, model, scaler, pop_size=50, generations=80, y_train_mean=None):
@@ -613,27 +614,47 @@ def run_real_optimization(progress_callback=None):
     fronts = optimizer.fast_non_dominated_sort(final_obj)
     pareto_idx = fronts[0]
     pareto_pop = final_pop[pareto_idx]
+    pareto_obj = final_obj[pareto_idx]
 
+    # Filter feasible (EFRF < 0.40)
+    preds = model.predict(scaler.transform(pareto_pop))
+    feasible_mask = preds[:, 2] < 0.40
+    pareto_pop = pareto_pop[feasible_mask]
+    pareto_obj = pareto_obj[feasible_mask]
+
+    # Store final Pareto front for plotting
+    st.session_state.final_pareto_pop = pareto_pop
+    st.session_state.final_pareto_obj = pareto_obj
+
+    # Build solutions list
     preds = model.predict(scaler.transform(pareto_pop))
     solutions = []
     for i, (row, pred) in enumerate(zip(pareto_pop, preds)):
         api, binder, pvpp, mgst, mcc, moisture = row[:6]
         density, tensile, efrf = pred[0], pred[1], pred[2]
-        # Only keep feasible solutions (EFRF < 0.40)
-        if efrf < 0.40:
-            quality = calculate_quality_score(density, tensile, efrf, api=api)
-            solutions.append({
-                'Solution': f'S{i+1}',
-                'API (%)': api, 'Binder (%)': binder, 'PVPP (%)': pvpp,
-                'MgSt (%)': mgst, 'MCC (%)': mcc, 'Moisture (%)': moisture,
-                'Total (%)': api + binder + pvpp + mgst + mcc + moisture,
-                'Density': density, 'Tensile (MPa)': tensile, 'EFRF': efrf,
-                'Quality Score': quality['overall']
-            })
+        quality = calculate_quality_score(density, tensile, efrf, api=api)
+        solutions.append({
+            'Solution': f'S{i+1}',
+            'API (%)': api, 'Binder (%)': binder, 'PVPP (%)': pvpp,
+            'MgSt (%)': mgst, 'MCC (%)': mcc, 'Moisture (%)': moisture,
+            'Total (%)': api + binder + pvpp + mgst + mcc + moisture,
+            'Density': density, 'Tensile (MPa)': tensile, 'EFRF': efrf,
+            'Quality Score': quality['overall'],
+            'original_idx': i
+        })
     solutions.sort(key=lambda x: x['Quality Score'], reverse=True)
     if not solutions:
-        return [], None, []
-    return solutions, solutions[0], gen_history
+        return [], None, gen_history
+
+    golden = solutions[0]
+    golden_idx = golden['original_idx']
+
+    st.session_state.golden_idx = golden_idx
+    st.session_state.golden_solution = golden
+    st.session_state.best_solutions = solutions
+    st.session_state.pareto_history = gen_history
+
+    return solutions, golden, gen_history
 
 def get_current_formulation_results():
     model = st.session_state.get('_trained_model')
@@ -1004,7 +1025,7 @@ def generate_feasible_samples(model, scaler, n_samples=3000):
     except Exception:
         return np.array([]), np.array([])
 
-# ---- IMPROVED PARETO PLOT ----
+# ---- FIXED PARETO PLOT ----
 def render_pareto_evolution():
     st.markdown("---")
     st.markdown("## 🌐 Pareto Front Evolution: API% vs EFRF")
@@ -1079,16 +1100,24 @@ def render_pareto_evolution():
         hovertemplate='API: %{x:.2f}%<br>EFRF: %{y:.3f}<extra></extra>'
     ))
 
-    # Golden solution
-    if golden:
+    # ---- Golden solution - ensure it is on the curve ----
+    final_gen = generations_recorded[-1]
+    if golden and gen_slider == final_gen:
+        golden_api = golden['API (%)']
+        # Find the index in api_sorted that is closest to golden_api
+        idx = np.argmin(np.abs(api_sorted - golden_api))
+        # Use the cummax value at that index to place the star exactly on the curve
+        golden_efrf_plot = cummax_efrf[idx]
         fig.add_trace(go.Scatter(
-            x=[golden['API (%)']],
-            y=[golden['EFRF']],
+            x=[api_sorted[idx]],
+            y=[golden_efrf_plot],
             mode='markers',
             name='🏆 Golden Solution',
             marker=dict(size=22, color='gold', symbol='star', line=dict(width=1.5, color='#8a6d00')),
-            hovertemplate=f"<b>🏆 Golden Solution</b><br>API: {golden['API (%)']:.2f}%<br>EFRF: {golden['EFRF']:.3f}<extra></extra>"
+            hovertemplate=f"<b>🏆 Golden Solution</b><br>API: {api_sorted[idx]:.2f}%<br>EFRF: {golden_efrf_plot:.3f}<extra></extra>"
         ))
+    elif golden and gen_slider != final_gen:
+        st.caption("The golden solution is from the final generation; it is not shown on this earlier front.")
 
     # Tested formulation
     tested = st.session_state.get('results')
@@ -1125,7 +1154,7 @@ def render_pareto_evolution():
         st.caption("Light blue points are random feasible formulations (all constraints satisfied).")
 
 # ================================================================
-# REMAINING UI FUNCTIONS
+# REMAINING UI FUNCTIONS (unchanged)
 # ================================================================
 def render_golden_solution(golden):
     if not golden:
