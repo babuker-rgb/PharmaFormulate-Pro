@@ -1,11 +1,11 @@
 # ================================================================
-# Hybrid AI v30.1-R32 · A to Z Complete Application
+# Hybrid AI v30.2-R32 · 
 # Multi-Objective Tablet Optimization
 # ================================================================
 
 import streamlit as st
 import numpy as np
-import pandas as pd
+import pandas as pd  # Important for type checking
 import torch
 import torch.nn as nn
 import plotly.graph_objects as go
@@ -23,7 +23,7 @@ warnings.filterwarnings('ignore')
 # ================================================================
 # PAGE CONFIG & CONSTANTS
 # ================================================================
-st.set_page_config(page_title="Hybrid AI v30.1", page_icon="🧬", layout="wide")
+st.set_page_config(page_title="Hybrid AI v30.2", page_icon="🧬", layout="wide")
 
 API_MIN, API_MAX = 80.0, 98.0
 BINDER_MIN, BINDER_MAX = 1.4, 6.0
@@ -124,7 +124,7 @@ class HybridTabletModel(nn.Module):
         return np.mean(preds, axis=0), np.std(preds, axis=0)
 
 # ================================================================
-# 3. ADVANCED OPTIMIZER
+# 3. ADVANCED OPTIMIZER (WITH FIXES FOR EVALUATION)
 # ================================================================
 class AdvancedOptimizer:
     def __init__(self, model, scaler, pop_size=80, generations=80, y_train_mean=None):
@@ -151,8 +151,16 @@ class AdvancedOptimizer:
         return balanced
 
     def evaluate(self, pop):
+        # FIX 1: Ensure input is numpy array and not a pandas object
         pop_scaled = self.scaler.transform(pop)
-        pred = self.model.forward(torch.FloatTensor(pop_scaled)).numpy()
+        if isinstance(pop_scaled, pd.DataFrame):
+            pop_scaled = pop_scaled.values
+        
+        # FIX 2: Set model to eval mode and disable gradient tracking
+        self.model.eval()
+        with torch.no_grad():
+            # Use torch.tensor with explicit float32 for clarity
+            pred = self.model(torch.tensor(pop_scaled, dtype=torch.float32)).numpy()
         
         density, tensile, efrf = pred[:, 0], pred[:, 1], pred[:, 2]
         
@@ -287,7 +295,7 @@ def perform_sensitivity_analysis(model, scaler, ref_solution):
         rf = RandomForestRegressor(n_estimators=50)
         X_local = np.random.normal(loc=ref_solution, scale=0.05*np.abs(ref_solution), size=(200, 8))
         X_scaled = scaler.transform(X_local)
-        y_local = model.forward(torch.FloatTensor(X_scaled)).numpy()[:, 0]
+        y_local = model(torch.tensor(X_scaled, dtype=torch.float32)).numpy()[:, 0]
         rf.fit(X_scaled, y_local)
         perm_importance = permutation_importance(rf, X_scaled, y_local)
         feature_names = ['API', 'Binder', 'PVPP', 'MgSt', 'MCC', 'Moisture', 'Pressure', 'Speed']
@@ -328,7 +336,7 @@ def render_dynamic_radar(solutions_df, selected_solutions):
 # 6. MAIN APPLICATION
 # ================================================================
 def main():
-    st.title("🧬 Hybrid AI v30.1-R32 · Complete Framework")
+    st.title("🧬 Hybrid AI v30.2-R32 · Complete Framework (Fixed)")
     
     # Load resources
     with st.spinner("Loading Physics-Informed Model..."):
@@ -386,7 +394,7 @@ def main():
         
         # Prediction with Uncertainty
         pop_scaled = scaler.transform([best_sol])
-        preds, uncertainty = model.predict_with_uncertainty(torch.FloatTensor(pop_scaled))
+        preds, uncertainty = model.predict_with_uncertainty(torch.tensor(pop_scaled, dtype=torch.float32))
         preds, uncertainty = preds[0], uncertainty[0]
         
         st.success(f"🏆 Golden Solution Found!\nAPI: {best_sol[0]:.2f}% | EFRF: {preds[2]:.3f} ± {uncertainty[2]:.3f}")
