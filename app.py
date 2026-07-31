@@ -1,7 +1,7 @@
 # ================================================================
 # Hybrid AI · Multi-Objective Tablet Optimization
 # Nile Valley University · Sudan · v29.28‑R32
-# VERSION 10 – IMPROVED PARETO PLOT & UI
+# FINAL – SMOOTH PARETO, FEASIBLE REGION TOGGLE, GOLDEN ON CURVE
 # ================================================================
 
 import streamlit as st
@@ -1125,7 +1125,7 @@ def render_pareto_evolution():
         st.caption("Light blue points are random feasible formulations (all constraints satisfied).")
 
 # ================================================================
-# REMAINING UI FUNCTIONS (unchanged)
+# REMAINING UI FUNCTIONS
 # ================================================================
 def render_golden_solution(golden):
     if not golden:
