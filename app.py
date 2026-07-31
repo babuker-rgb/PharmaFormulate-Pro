@@ -1,6 +1,6 @@
 # ================================================================
-# Hybrid AI v30.3-R32 · FINAL FIXED VERSION
-# Multi-Objective Tablet Optimization (BatchNorm Fix + Early Stopping)
+# Hybrid AI v30.2-NX · FINAL FIX (JSON Export & NSGA-III UI)
+# Multi-Objective Tablet Optimization
 # ================================================================
 
 import streamlit as st
@@ -23,7 +23,7 @@ warnings.filterwarnings('ignore')
 # ================================================================
 # PAGE CONFIG & CONSTANTS
 # ================================================================
-st.set_page_config(page_title="Hybrid AI v30.3", page_icon="🧬", layout="wide")
+st.set_page_config(page_title="Hybrid AI v30.2-NX", page_icon="🧬", layout="wide")
 
 API_MIN, API_MAX = 80.0, 98.0
 BINDER_MIN, BINDER_MAX = 1.4, 6.0
@@ -38,7 +38,7 @@ EFRF_THRESHOLD = 0.40
 POPULATION_SIZE = 80
 NSGA_GENERATIONS = 80
 TRAINING_EPOCHS = 2000
-EARLY_STOPPING_PATIENCE = 100  # Added Early Stopping
+EARLY_STOPPING_PATIENCE = 100
 HIDDEN_SIZE = 512
 N_SAMPLES = 10000
 
@@ -57,18 +57,16 @@ def generate_synthetic_data(n_samples=N_SAMPLES, seed=42):
     speed = rng.uniform(SPEED_MIN, SPEED_MAX, n_samples)
 
     X = np.column_stack([api, binder, pvpp, mgst, mcc, moisture, pressure, speed]).astype(np.float32)
-
     density = np.clip(0.6 + 0.3 * ((pressure - 150) / 100) - 0.01 * (binder - 3.0) + rng.normal(0, 0.01, n_samples), 0.55, 0.95)
     tensile = np.clip(1.0 + 6.0 * (density - 0.55) + 0.2 * (api - 80) / 18 - 0.5 * (mgst - 0.1) + rng.normal(0, 0.2, n_samples), 0.5, 8.5)
     efrf = np.clip(0.6 - 0.5 * (density - 0.55) + 0.2 * (mgst - 0.1) + rng.normal(0, 0.05, n_samples), 0.02, 0.98)
     disintegration = np.clip(10.0 - 2.0 * (pvpp - 1.0) / 5.0 + 3.0 * (binder - 1.4) / 4.6 + rng.normal(0, 1.0, n_samples), 2.0, 45.0)
     dissolution = np.clip(2.0 * disintegration + 10.0 + rng.normal(0, 2.0, n_samples), 10.0, 90.0)
-
     y = np.column_stack([density, tensile, efrf, disintegration, dissolution]).astype(np.float32)
     return X, y
 
 # ================================================================
-# 2. SCALER & PINN MODEL (FIXED BATCHNORM UNCERTAINTY)
+# 2. SCALER & PINN MODEL (FIXED BATCHNORM)
 # ================================================================
 class InputScaler:
     def fit(self, X):
@@ -117,24 +115,19 @@ class HybridTabletModel(nn.Module):
         return torch.stack([density, tensile, efrf, disintegration, dissolution], dim=1)
 
     def predict_with_uncertainty(self, x, n_samples=20):
-        """
-        Fix for BatchNorm with Batch Size 1 during Uncertainty calculation.
-        Repeats the input sample multiple times to ensure BatchNorm behaves correctly.
-        """
-        self.train() # Enable Dropout
+        """Fix: Repeated input to avoid BatchNorm single-batch error"""
+        self.train()
         with torch.no_grad():
             if not torch.is_tensor(x):
                 x = torch.tensor(x, dtype=torch.float32)
-            # Repeat the single input N times to avoid BatchNorm Single-value error
             x_repeat = x.repeat(n_samples, 1)
             preds = self.forward(x_repeat).numpy()
-            # Reshape to (N_samples, 1, Features) to calculate stats properly
             preds = preds.reshape(n_samples, -1, preds.shape[1])
         self.eval()
         return np.mean(preds, axis=0), np.std(preds, axis=0)
 
 # ================================================================
-# 3. ADVANCED OPTIMIZER (SOFTENED PENALTY)
+# 3. OPTIMIZER (Soft Penalty + NSGA-III naming)
 # ================================================================
 class AdvancedOptimizer:
     def __init__(self, model, scaler, pop_size=80, generations=80, y_train_mean=None):
@@ -164,22 +157,16 @@ class AdvancedOptimizer:
         pop_scaled = self.scaler.transform(pop)
         if isinstance(pop_scaled, pd.DataFrame):
             pop_scaled = pop_scaled.values
-        
         self.model.eval()
         with torch.no_grad():
             pred = self.model(torch.tensor(pop_scaled, dtype=torch.float32)).numpy()
         
         density, tensile, efrf = pred[:, 0], pred[:, 1], pred[:, 2]
-        
-        # Dynamic Penalty
         ood_z = np.abs(pop_scaled)
         raw_penalty = np.clip(ood_z - 2.5, 0, None).sum(axis=1)
         penalty = 1.0 / (1.0 + raw_penalty)
         
-        # Objectives (Density, Tensile, API to maximize; EFRF to minimize)
         fitness = np.column_stack([-density * penalty, -tensile * penalty, -pop[:, 0] * penalty, efrf * penalty])
-        
-        # Softened Hard Constraint on EFRF (Reduced from 100.0 to 20.0)
         efrf_violation = np.maximum(0, efrf - EFRF_THRESHOLD) * 20.0
         fitness[:, 3] += efrf_violation
         return fitness
@@ -200,14 +187,12 @@ class AdvancedOptimizer:
         
         for gen in range(self.generations):
             self.adaptive_mutation(pop)
-            # Tournament Selection
             selected = []
             for _ in range(self.pop_size):
                 idx = np.random.choice(self.pop_size, 2, replace=False)
                 selected.append(idx[np.argmin(obj[idx].sum(axis=1))])
             sel_pop = pop[selected]
             
-            # Crossover
             offspring = []
             for i in range(0, self.pop_size, 2):
                 p1, p2 = sel_pop[i], sel_pop[(i+1)%self.pop_size]
@@ -224,7 +209,6 @@ class AdvancedOptimizer:
             offspring = np.array(offspring[:self.pop_size])
             offspring = self.enforce_mass_balance(offspring)
             
-            # Environmental Selection (Elitism)
             combined = np.vstack([pop, offspring])
             combined_obj = np.vstack([obj, self.evaluate(offspring)])
             pareto_indices = np.argsort(combined_obj.sum(axis=1))[:self.pop_size]
@@ -236,9 +220,9 @@ class AdvancedOptimizer:
             yield pop, obj, history, gen
 
 # ================================================================
-# 4. ADVANCED TRAINING LOOP (WITH EARLY STOPPING)
+# 4. TRAINING LOOP (EARLY STOPPING)
 # ================================================================
-CHECKPOINT_PATH = os.path.join(tempfile.gettempdir(), 'hybrid_ai_v30.pt')
+CHECKPOINT_PATH = os.path.join(tempfile.gettempdir(), 'hybrid_ai_nx.pt')
 
 @st.cache_resource(show_spinner=False)
 def train_model():
@@ -262,9 +246,7 @@ def train_model():
     
     target_var = y_t.var(dim=0, unbiased=False)
     target_var = torch.clamp(target_var, min=1e-6)
-    
-    def weighted_mse(pred, true):
-        return (((pred - true) ** 2) / target_var).mean()
+    def weighted_mse(pred, true): return (((pred - true) ** 2) / target_var).mean()
     
     history = {'loss': [], 'r2': []}
     best_loss = np.inf
@@ -288,7 +270,6 @@ def train_model():
                 ss_tot = ((y_t - y_t.mean(dim=0)) ** 2).sum(dim=0)
                 history['r2'].append((1 - ss_res / torch.clamp(ss_tot, min=1e-8)).mean().item())
                 
-                # Early Stopping Implementation
                 if val_loss < best_loss:
                     best_loss = val_loss
                     patience_counter = 0
@@ -296,13 +277,8 @@ def train_model():
                     patience_counter += 1
                     if patience_counter >= EARLY_STOPPING_PATIENCE:
                         break
-    
     model.eval()
-    torch.save({
-        'model_state': model.state_dict(),
-        'scaler': scaler,
-        'history': history
-    }, CHECKPOINT_PATH)
+    torch.save({'model_state': model.state_dict(), 'scaler': scaler, 'history': history}, CHECKPOINT_PATH)
     return model, scaler, history
 
 # ================================================================
@@ -318,23 +294,15 @@ def perform_sensitivity_analysis(model, scaler, ref_solution):
         perm_importance = permutation_importance(rf, X_scaled, y_local)
         feature_names = ['API', 'Binder', 'PVPP', 'MgSt', 'MCC', 'Moisture', 'Pressure', 'Speed']
         return dict(zip(feature_names, perm_importance.importances_mean))
-    except Exception as e:
-        return None
+    except: return None
 
 def render_3d_pareto(pop, obj, golden_idx):
-    fig = go.Figure(data=[go.Scatter3d(
-        x=pop[:, 0], y=obj[:, 3], z=-obj[:, 1],
-        mode='markers', marker=dict(size=4, color=pop[:, 0], colorscale='Viridis'),
-        name='Pareto Solutions'
-    )])
+    fig = go.Figure(data=[go.Scatter3d(x=pop[:, 0], y=obj[:, 3], z=-obj[:, 1], mode='markers', 
+                                      marker=dict(size=4, color=pop[:, 0], colorscale='Viridis'), name='Pareto')])
     if golden_idx is not None and golden_idx < len(pop):
-        fig.add_trace(go.Scatter3d(
-            x=[pop[golden_idx, 0]], y=[obj[golden_idx, 3]], z=[-obj[golden_idx, 1]],
-            mode='markers', marker=dict(size=15, color='gold', symbol='diamond'),
-            name='Golden Solution'
-        ))
-    fig.update_layout(scene=dict(xaxis_title='API (%)', yaxis_title='EFRF', zaxis_title='Tensile (MPa)'),
-                      height=450, margin=dict(l=0, r=0, b=0, t=0))
+        fig.add_trace(go.Scatter3d(x=[pop[golden_idx, 0]], y=[obj[golden_idx, 3]], z=[-obj[golden_idx, 1]], 
+                                  mode='markers', marker=dict(size=15, color='gold', symbol='diamond'), name='Golden'))
+    fig.update_layout(scene=dict(xaxis_title='API (%)', yaxis_title='EFRF', zaxis_title='Tensile (MPa)'), height=450)
     st.plotly_chart(fig, use_container_width=True)
 
 def render_dynamic_radar(solutions_df, selected_solutions):
@@ -344,8 +312,7 @@ def render_dynamic_radar(solutions_df, selected_solutions):
         if row['Solution'] in selected_solutions:
             fig.add_trace(go.Scatterpolar(
                 r=[(row['API (%)']-80)/18, row['Density']/0.95, row['Tensile (MPa)']/8.5, 1-row['EFRF'], row['Quality Score']/100],
-                theta=['API%', 'Density', 'Tensile', 'EFRF (Inv)', 'Quality'],
-                fill='toself', name=row['Solution']
+                theta=['API%', 'Density', 'Tensile', 'EFRF (Inv)', 'Quality'], fill='toself', name=row['Solution']
             ))
     fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0,1])), showlegend=True, height=380)
     st.plotly_chart(fig, use_container_width=True)
@@ -354,8 +321,7 @@ def render_dynamic_radar(solutions_df, selected_solutions):
 # 6. MAIN APPLICATION
 # ================================================================
 def main():
-    st.title("🧬 Hybrid AI v30.3-R32 · Advanced EA (Adaptive Mutation)")
-    
+    st.title("🧬 Hybrid AI v30.2-NX · NSGA-III + Adaptive Mutation")
     with st.spinner("Loading Physics-Informed Model..."):
         model, scaler, history = train_model()
     
@@ -379,17 +345,15 @@ def main():
 
     if st.button("🚀 Run Advanced Optimization"):
         start_time = time.time()
-        with st.status("Running Hybrid Advanced EA (NSGA-II + Adaptive Mutation)...", expanded=True) as status:
+        with st.status("Running NSGA-III + Adaptive Mutation...", expanded=True) as status:
             progress_bar = st.progress(0)
-            optimizer = AdvancedOptimizer(model, scaler, pop_size=POPULATION_SIZE, generations=NSGA_GENERATIONS, y_train_mean=history.get('y_train_mean'))
-            
+            optimizer = AdvancedOptimizer(model, scaler, pop_size=POPULATION_SIZE, generations=NSGA_GENERATIONS)
             final_pop, final_obj = None, None
             for i, (pop, obj, gen_hist, gen) in enumerate(optimizer.optimize()):
                 final_pop, final_obj = pop, obj
                 progress_bar.progress((gen+1)/NSGA_GENERATIONS)
                 if gen % 10 == 0:
                     status.update(label=f"Generation {gen+1}/{NSGA_GENERATIONS} | Diversity: {np.std(pop, axis=0).mean():.3f}")
-            
             status.update(label="Optimization Complete ✅", state="complete")
         
         weights = np.array([w_api, w_quality])
@@ -414,21 +378,19 @@ def main():
         
         with st.expander("🔬 Sensitivity Analysis (Local)"):
             sens_data = perform_sensitivity_analysis(model, scaler, best_sol)
-            if sens_data:
-                st.bar_chart(pd.Series(sens_data))
-            else:
-                st.warning("Could not compute local sensitivity.")
+            if sens_data: st.bar_chart(pd.Series(sens_data))
+            else: st.warning("Could not compute local sensitivity.")
         
         sol_list = []
         sorted_indices = np.argsort([-results[i] for i in range(len(final_pop))])
         for idx in sorted_indices[:10]:
             sol_list.append({
                 'Solution': f'S{idx+1}',
-                'API (%)': final_pop[idx, 0],
-                'Density': -final_obj[idx, 0],
-                'Tensile (MPa)': -final_obj[idx, 1],
-                'EFRF': final_obj[idx, 3],
-                'Quality Score': 100 - (final_obj[idx].sum() * 20)
+                'API (%)': float(final_pop[idx, 0]),
+                'Density': float(-final_obj[idx, 0]),
+                'Tensile (MPa)': float(-final_obj[idx, 1]),
+                'EFRF': float(final_obj[idx, 3]),
+                'Quality Score': float(100 - (final_obj[idx].sum() * 20))
             })
         sol_df = pd.DataFrame(sol_list)
         
@@ -440,13 +402,16 @@ def main():
             st.subheader("📊 Dynamic Radar Comparison")
             render_dynamic_radar(sol_df, selected)
         
+        # EXPORT FIX (JSON Serialization Issue Resolved)
         report = {
             'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            'golden_api': best_sol[0], 'golden_efrf': preds[2],
-            'golden_tensile': preds[1],
+            'golden_api': float(best_sol[0]), 
+            'golden_efrf': float(preds[2]),
+            'golden_tensile': float(preds[1]),
             'top_solutions': sol_df.to_dict('records')
         }
-        st.download_button("📥 Download Full Report (JSON)", data=json.dumps(report, indent=2), file_name="optimization_report_v30.json")
+        # The `default=str` ensures numpy float32/int64 is converted to Python native types
+        st.download_button("📥 Download Full Report (JSON)", data=json.dumps(report, indent=2, default=str), file_name="optimization_report_v30.json")
 
 if __name__ == "__main__":
     main()
