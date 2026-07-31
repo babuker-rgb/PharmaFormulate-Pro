@@ -1,7 +1,7 @@
 # ================================================================
 # Hybrid AI · Multi-Objective Tablet Optimization
 # Nile Valley University · Sudan · v29.28‑R32
-# VERSION 13 – POP=80, R²>0.95, GOLDEN ON CURVE
+# FINAL – POP=80, GENS=120, GOLDEN ON CURVE
 # ================================================================
 
 import streamlit as st
@@ -57,13 +57,14 @@ BINDER_GRADES = {
 }
 BINDER_GRADE_NAMES = list(BINDER_GRADES.keys())
 
-# Improved NSGA‑II parameters
+# NSGA‑II parameters
 POPULATION_SIZE = 80
 NSGA_GENERATIONS = 120
-# Improved training parameters
+# Model parameters
 TRAINING_EPOCHS = 2000
 HIDDEN_SIZE = 512
 EARLY_STOPPING_PATIENCE = 80
+N_SAMPLES = 8000  # increase to 15000 for R² >0.95
 
 # ================================================================
 # SESSION STATE
@@ -179,10 +180,7 @@ class HybridTabletModel(nn.Module):
 # ================================================================
 # DATA GENERATION
 # ================================================================
-N_SAMPLES = 8000
-BOUNDARY_FRACTION = 0.30
-
-def _sample_compositions(n_samples, rng, boundary_fraction=0.0):
+def _sample_compositions(n_samples, rng, boundary_fraction=0.30):
     bounds = [(API_MIN, API_MAX), (BINDER_MIN, BINDER_MAX), (PVPP_MIN, PVPP_MAX),
               (MGST_MIN, MGST_MAX), (MCC_MIN, MCC_MAX), (MOISTURE_MIN, MOISTURE_MAX)]
     cols = [rng.uniform(lo, hi, n_samples) for lo, hi in bounds]
@@ -204,7 +202,7 @@ def _sample_compositions(n_samples, rng, boundary_fraction=0.0):
 
 def generate_synthetic_data(n_samples=N_SAMPLES, seed=42):
     rng = np.random.default_rng(seed)
-    comps = _sample_compositions(n_samples, rng, boundary_fraction=BOUNDARY_FRACTION)
+    comps = _sample_compositions(n_samples, rng, boundary_fraction=0.30)
     comps = comps / comps.sum(axis=1, keepdims=True) * 100.0
     api_n, binder_n, pvpp_n, mgst_n, mcc_n, moisture_n = comps.T
 
@@ -253,7 +251,7 @@ class InputScaler:
 # ================================================================
 # CHECKPOINT PATHS
 # ================================================================
-CHECKPOINT_SYNTHETIC = os.path.join(tempfile.gettempdir(), 'co_hybai_synthetic_v13.pt')
+CHECKPOINT_SYNTHETIC = os.path.join(tempfile.gettempdir(), 'co_hybai_final.pt')
 
 def _data_fingerprint(df):
     try:
@@ -631,11 +629,9 @@ def run_real_optimization(progress_callback=None):
     pareto_pop = pareto_pop[feasible_mask]
     pareto_obj = pareto_obj[feasible_mask]
 
-    # Store final Pareto front for plotting
     st.session_state.final_pareto_pop = pareto_pop
     st.session_state.final_pareto_obj = pareto_obj
 
-    # Build solutions list
     preds = model.predict(scaler.transform(pareto_pop))
     solutions = []
     for i, (row, pred) in enumerate(zip(pareto_pop, preds)):
@@ -985,7 +981,6 @@ def render_training_progress():
             )
 
 def generate_feasible_samples(model, scaler, n_samples=3000):
-    """Generate random formulations, predict, and return feasible ones (all constraints)."""
     if model is None or scaler is None:
         return np.array([]), np.array([])
     try:
@@ -1049,27 +1044,22 @@ def render_pareto_evolution():
     current_obj = current_entry['pareto_objectives']
     current_pop = current_entry['pareto_solutions']
 
-    # Extract data
     api_vals = current_pop[:, 0]
     efrf_vals = current_obj[:, 2]
 
-    # Filter feasible (EFRF < 0.40)
     feasible_mask = efrf_vals < 0.40
     api_feas = api_vals[feasible_mask]
     efrf_feas = efrf_vals[feasible_mask]
 
-    # Sort by API
     sort_idx = np.argsort(api_feas)
     api_sorted = api_feas[sort_idx]
     efrf_sorted = efrf_feas[sort_idx]
 
-    # Enforce monotonic (cumulative maximum) for smooth curve
     if len(efrf_sorted) > 0:
         cummax_efrf = np.maximum.accumulate(efrf_sorted)
     else:
         cummax_efrf = efrf_sorted
 
-    # Get model and scaler for feasible region
     model = st.session_state.get('_trained_model')
     scaler = st.session_state.get('_trained_scaler')
     feat_api, feat_efrf = np.array([]), np.array([])
@@ -1079,13 +1069,11 @@ def render_pareto_evolution():
         except Exception:
             pass
 
-    # Toggle for feasible region
     show_feasible = st.checkbox("Show feasible region", value=st.session_state.get('show_feasible', True))
     st.session_state.show_feasible = show_feasible
 
     fig = go.Figure()
 
-    # Feasible region (light blue)
     if show_feasible and len(feat_api) > 0:
         fig.add_trace(go.Scatter(
             x=feat_api,
@@ -1097,7 +1085,6 @@ def render_pareto_evolution():
             showlegend=True
         ))
 
-    # Smooth Pareto front line + markers
     fig.add_trace(go.Scatter(
         x=api_sorted,
         y=cummax_efrf,
@@ -1108,13 +1095,10 @@ def render_pareto_evolution():
         hovertemplate='API: %{x:.2f}%<br>EFRF: %{y:.3f}<extra></extra>'
     ))
 
-    # ---- Golden solution - ensure it is on the curve ----
     final_gen = generations_recorded[-1]
     if golden and gen_slider == final_gen:
         golden_api = golden['API (%)']
-        # Find the index in api_sorted that is closest to golden_api
         idx = np.argmin(np.abs(api_sorted - golden_api))
-        # Use the cummax value at that index to place the star exactly on the curve
         golden_efrf_plot = cummax_efrf[idx]
         fig.add_trace(go.Scatter(
             x=[api_sorted[idx]],
@@ -1127,7 +1111,6 @@ def render_pareto_evolution():
     elif golden and gen_slider != final_gen:
         st.caption("The golden solution is from the final generation; it is not shown on this earlier front.")
 
-    # Tested formulation
     tested = st.session_state.get('results')
     if tested and 'api' in tested and 'efrf' in tested:
         fig.add_trace(go.Scatter(
@@ -1139,7 +1122,6 @@ def render_pareto_evolution():
             hovertemplate=f"<b>Tested Formulation</b><br>API: {tested['api']:.2f}%<br>EFRF: {tested['efrf']:.3f}<extra></extra>"
         ))
 
-    # Boundaries
     fig.add_hline(y=0.40, line_dash='dash', line_color='gray', annotation_text='EFRF limit (0.40)')
     fig.add_vline(x=API_MIN, line_dash='dash', line_color='gray', annotation_text=f'API min ({API_MIN}%)')
     fig.add_vline(x=API_MAX, line_dash='dash', line_color='gray', annotation_text=f'API max ({API_MAX}%)')
@@ -1162,7 +1144,7 @@ def render_pareto_evolution():
         st.caption("Light blue points are random feasible formulations (all constraints satisfied).")
 
 # ================================================================
-# REMAINING UI FUNCTIONS
+# REMAINING UI FUNCTIONS (unchanged)
 # ================================================================
 def render_golden_solution(golden):
     if not golden:
