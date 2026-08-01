@@ -76,7 +76,7 @@ def initialize_session_state():
         'runtime': 0, 'pareto_history': None,
         'user_data': None, 'data_source': 'synthetic',
         'force_retrain': False,
-        '_trained_model': None, '_trained_scaler': None, '_trained_history': None # Explicitly add these
+        '_trained_model': None, '_trained_scaler': None, '_trained_history': None
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -681,6 +681,7 @@ def run_real_optimization(progress_callback=None):
     pareto_pop = final_pop[pareto_idx]
     pareto_obj = final_obj[pareto_idx]
 
+    # Filter feasible solutions (EFRF < 0.40) for building the list
     preds = model.predict(scaler.transform(pareto_pop))
     solutions = []
     for i, (row, pred) in enumerate(zip(pareto_pop, preds)):
@@ -1425,7 +1426,16 @@ def main():
             st.error("Model or Scaler not found. Please ensure training completed successfully.")
             st.stop()
 
-        # Calculate Golden solution ONLY from Pareto Front solutions (pareto_pop, pareto_obj)
+        # ---- FIX: Filter Pareto front to only feasible solutions (EFRF < 0.40) ----
+        feasible_mask = pareto_obj[:, 2] < 0.40
+        if not np.any(feasible_mask):
+            st.error("No feasible Pareto solutions found (EFRF >= 0.40 for all). Try adjusting constraints.")
+            st.stop()
+        pareto_pop = pareto_pop[feasible_mask]
+        pareto_obj = pareto_obj[feasible_mask]
+        # ------------------------------------------------------------------------
+
+        # Calculate Golden solution ONLY from feasible Pareto front solutions
         weights = np.array([w_api, w_quality])
         scores = []
         for i in range(len(pareto_pop)):
@@ -1435,21 +1445,18 @@ def main():
         best_sol = pareto_pop[golden_idx]
         
         # Predict uncertainty for the golden solution
-        # FIX: Ensure best_sol exists before transforming
-        if best_sol is not None:
-            pop_scaled = scaler.transform([best_sol])
-            preds, unc = model.predict_with_uncertainty(torch.tensor(pop_scaled, dtype=torch.float32))
-            preds, unc = preds[0], unc[0]
-            st.success(f"🏆 Golden Solution Found!\nAPI: {best_sol[0]:.2f}% | EFRF: {preds[2]:.3f} ± {unc[2]:.3f}")
-            st.caption(f"Optimization took {st.session_state.runtime:.2f} seconds.")
-        else:
-            st.error("No valid Pareto solutions found. Try adjusting constraints.")
-            st.stop()
+        pop_scaled = scaler.transform([best_sol])
+        preds, unc = model.predict_with_uncertainty(torch.tensor(pop_scaled, dtype=torch.float32))
+        preds, unc = preds[0], unc[0]
+        st.success(f"🏆 Golden Solution Found!\nAPI: {best_sol[0]:.2f}% | EFRF: {preds[2]:.3f} ± {unc[2]:.3f}")
+        st.caption(f"Optimization took {st.session_state.runtime:.2f} seconds.")
 
-        # Compute Tested Formulation Data
-        slider_form = np.array([[api, binder, pvpp, mgst, mcc, moisture, pressure, speed]], dtype=np.float32)
+        # Compute Tested Formulation Data using st.session_state
+        slider_form = np.array([[st.session_state.api, st.session_state.binder, st.session_state.pvpp,
+                                 st.session_state.mgst, st.session_state.mcc, st.session_state.moisture,
+                                 st.session_state.pressure, st.session_state.speed]], dtype=np.float32)
         slider_preds, _ = model.predict_with_uncertainty(torch.tensor(scaler.transform(slider_form), dtype=torch.float32))
-        tested_data = {'api': float(api), 'efrf': float(slider_preds[0][2]), 'tensile': float(slider_preds[0][1])}
+        tested_data = {'api': float(st.session_state.api), 'efrf': float(slider_preds[0][2]), 'tensile': float(slider_preds[0][1])}
 
         # Build Solutions DataFrame for Radar / Exports (from pareto solutions)
         sol_list = []
@@ -1471,9 +1478,11 @@ def main():
         render_pareto_evolution()
         
         st.subheader("🌐 3D Pareto Front (API - EFRF - Tensile)")
+        # Re-create final population from gen_history for 3D plot (if needed)
         last_entry = gen_history[-1]
         final_pop_hist = last_entry['population']
         final_obj_hist = last_entry['objectives']
+        # Find golden index in this population for 3D plot marker
         golden_idx_hist = None
         if golden:
             for i, row in enumerate(final_pop_hist):
