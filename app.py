@@ -76,6 +76,7 @@ def initialize_session_state():
         'runtime': 0, 'pareto_history': None,
         'user_data': None, 'data_source': 'synthetic',
         'force_retrain': False,
+        '_trained_model': None, '_trained_scaler': None, '_trained_history': None # Explicitly add these
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -1417,6 +1418,13 @@ def main():
         st.session_state.sidebar_w_api = w_api
         st.session_state.sidebar_w_quality = w_quality
         
+        # FIX: Verify model and scaler are available
+        model = st.session_state.get('_trained_model')
+        scaler = st.session_state.get('_trained_scaler')
+        if model is None or scaler is None:
+            st.error("Model or Scaler not found. Please ensure training completed successfully.")
+            st.stop()
+
         # Calculate Golden solution ONLY from Pareto Front solutions (pareto_pop, pareto_obj)
         weights = np.array([w_api, w_quality])
         scores = []
@@ -1427,11 +1435,16 @@ def main():
         best_sol = pareto_pop[golden_idx]
         
         # Predict uncertainty for the golden solution
-        pop_scaled = scaler.transform([best_sol])
-        preds, unc = model.predict_with_uncertainty(torch.tensor(pop_scaled, dtype=torch.float32))
-        preds, unc = preds[0], unc[0]
-        st.success(f"🏆 Golden Solution Found!\nAPI: {best_sol[0]:.2f}% | EFRF: {preds[2]:.3f} ± {unc[2]:.3f}")
-        st.caption(f"Optimization took {st.session_state.runtime:.2f} seconds.")
+        # FIX: Ensure best_sol exists before transforming
+        if best_sol is not None:
+            pop_scaled = scaler.transform([best_sol])
+            preds, unc = model.predict_with_uncertainty(torch.tensor(pop_scaled, dtype=torch.float32))
+            preds, unc = preds[0], unc[0]
+            st.success(f"🏆 Golden Solution Found!\nAPI: {best_sol[0]:.2f}% | EFRF: {preds[2]:.3f} ± {unc[2]:.3f}")
+            st.caption(f"Optimization took {st.session_state.runtime:.2f} seconds.")
+        else:
+            st.error("No valid Pareto solutions found. Try adjusting constraints.")
+            st.stop()
 
         # Compute Tested Formulation Data
         slider_form = np.array([[api, binder, pvpp, mgst, mcc, moisture, pressure, speed]], dtype=np.float32)
