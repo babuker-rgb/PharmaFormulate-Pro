@@ -244,7 +244,7 @@ class InputScaler:
 # ================================================================
 # CHECKPOINT PATHS
 # ================================================================
-CHECKPOINT_SYNTHETIC = os.path.join(tempfile.gettempdir(), 'co_hybai_synthetic_v9.pt')
+CHECKPOINT_SYNTHETIC = os.path.join(tempfile.gettempdir(), 'co_hybai_synthetic_v10_physics.pt')
 
 def _data_fingerprint(df):
     try:
@@ -309,6 +309,24 @@ def train_model(use_real=False, _real_df=None, data_fingerprint=None):
     y_train_t = torch.tensor(y[train_idx], dtype=torch.float32)
     X_val_t = torch.tensor(X_scaled[val_idx], dtype=torch.float32)
     y_val_t = torch.tensor(y[val_idx], dtype=torch.float32)
+
+    # BUGFIX: this model was labeled "physics-informed" in the UI (see the
+    # training spinner text) but the training loop previously used ONLY
+    # weighted_mse against the synthetic targets — no physics equation was
+    # ever enforced during training. That makes it a plain data-driven
+    # network trained on physics-motivated data, not an actual PINN. Added
+    # a genuine physics-residual term using the exact same Heckel-style
+    # density relationship generate_synthetic_data() itself uses to build
+    # the ground truth (raw, unscaled pressure/binder from X — column 6 is
+    # pressure, column 1 is binder), so the model is now regularised
+    # toward physical consistency independent of what the sampled data
+    # says, not just fit to it.
+    pressure_train_t = torch.tensor(X[train_idx, 6], dtype=torch.float32)
+    binder_train_t = torch.tensor(X[train_idx, 1], dtype=torch.float32)
+
+    def calculate_heckel_density_torch(pressure, binder):
+        porosity0 = 0.45 - 0.001 * (pressure - PRESSURE_MIN) - 0.01 * (binder - 3.0)
+        return torch.clamp(1.0 - porosity0 * torch.exp(-0.01 * (pressure - PRESSURE_MIN)), 0.55, 0.95)
     
     model = HybridTabletModel(input_dim=8, hidden_dim=256)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
@@ -321,6 +339,7 @@ def train_model(use_real=False, _real_df=None, data_fingerprint=None):
         return (((pred - true) ** 2) / target_var).mean()
     
     loss_fn = weighted_mse
+    PHYSICS_LOSS_WEIGHT = 0.1
     history = {'loss': [], 'r2': [], 'rmse': [], 'data_source': data_source}
     best_val_loss = np.inf
     best_state = None
@@ -331,6 +350,12 @@ def train_model(use_real=False, _real_df=None, data_fingerprint=None):
         optimizer.zero_grad()
         pred = model(X_train_t)
         loss = loss_fn(pred, y_train_t)
+        # NEW: physics-residual term — penalises the model's density
+        # prediction for deviating from the Heckel-style equation,
+        # regardless of what the (noisy) sampled target says.
+        physical_density = calculate_heckel_density_torch(pressure_train_t, binder_train_t)
+        physics_loss = torch.mean((pred[:, 0] - physical_density) ** 2) * PHYSICS_LOSS_WEIGHT
+        loss = loss + physics_loss
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
