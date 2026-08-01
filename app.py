@@ -1,5 +1,5 @@
 # ================================================================
-# Hybrid AI v32.2-Ultimate-Pro-Full · Integrated UI/Physics/3D/Radar
+# Hybrid AI v32.3-Ultimate-Pro-Full · Fixed 3D Data Flow
 # ================================================================
 
 import streamlit as st
@@ -23,7 +23,7 @@ warnings.filterwarnings('ignore')
 # PAGE CONFIG
 # ================================================================
 st.set_page_config(
-    page_title="Hybrid AI v32.2-Pro-Full", page_icon="🧬", layout="wide"
+    page_title="Hybrid AI v32.3-Pro-Full", page_icon="🧬", layout="wide"
 )
 
 # ================================================================
@@ -569,12 +569,42 @@ def perform_sensitivity_analysis(model, scaler, ref_solution):
     except: return None
 
 def render_3d_pareto(pop, obj, golden_idx, tested_data=None):
-    fig = go.Figure(data=[go.Scatter3d(x=pop[:, 0], y=obj[:, 2], z=-obj[:, 1], mode='markers', marker=dict(size=4, color=pop[:, 0], colorscale='Viridis'), name='Pareto')])
-    if golden_idx is not None:
-        fig.add_trace(go.Scatter3d(x=[pop[golden_idx, 0]], y=[obj[golden_idx, 2]], z=[-obj[golden_idx, 1]], mode='markers', marker=dict(size=15, color='gold', symbol='diamond'), name='🏆 Golden'))
+    # FIX: Ensure we handle the correct dimensions. 
+    # pop should be (N_solutions, 8), obj should be (N_solutions, 3)
+    # Tested data is a dict with {'api': float, 'efrf': float, 'tensile': float}
+    fig = go.Figure()
+    if len(pop) > 0 and len(obj) > 0:
+        fig.add_trace(go.Scatter3d(
+            x=pop[:, 0],      # API
+            y=obj[:, 2],      # EFRF
+            z=-obj[:, 1],     # -Tensile (Tensile is negated in fitness, so -obj is actual)
+            mode='markers',
+            marker=dict(size=4, color=pop[:, 0], colorscale='Viridis'),
+            name='Pareto Solutions'
+        ))
+    if golden_idx is not None and golden_idx < len(pop):
+        fig.add_trace(go.Scatter3d(
+            x=[pop[golden_idx, 0]], 
+            y=[obj[golden_idx, 2]], 
+            z=[-obj[golden_idx, 1]], 
+            mode='markers', 
+            marker=dict(size=15, color='gold', symbol='diamond'), 
+            name='🏆 Golden Solution'
+        ))
     if tested_data is not None:
-        fig.add_trace(go.Scatter3d(x=[tested_data['api']], y=[tested_data['efrf']], z=[tested_data['tensile']], mode='markers', marker=dict(size=12, color='blue', symbol='circle', line=dict(color='white', width=1)), name='🔵 Tested'))
-    fig.update_layout(scene=dict(xaxis_title='API (%)', yaxis_title='EFRF', zaxis_title='Tensile (MPa)'), height=450)
+        fig.add_trace(go.Scatter3d(
+            x=[tested_data['api']], 
+            y=[tested_data['efrf']], 
+            z=[tested_data['tensile']], 
+            mode='markers', 
+            marker=dict(size=12, color='blue', symbol='circle', line=dict(color='white', width=1)), 
+            name='🔵 Tested Formulation'
+        ))
+    fig.update_layout(
+        scene=dict(xaxis_title='API (%)', yaxis_title='EFRF', zaxis_title='Tensile (MPa)'), 
+        height=450,
+        margin=dict(l=0, r=0, b=0, t=0)
+    )
     st.plotly_chart(fig, use_container_width=True)
 
 def render_dynamic_radar(solutions_df, selected_solutions):
@@ -653,7 +683,14 @@ def render_pareto_evolution():
 def render_golden_solution(golden):
     if not golden: return
     st.markdown("---"); st.markdown("## 🏆 Golden Solution (Balanced Trade-off)")
-    st.json(golden)
+    # FIX: convert numpy types to Python native types for clean JSON display
+    clean_golden = {}
+    for k, v in golden.items():
+        if hasattr(v, "item"): # Check if it's a numpy type
+            clean_golden[k] = v.item()
+        else:
+            clean_golden[k] = v
+    st.json(clean_golden)
 
 # ================================================================
 # UI INPUT FUNCTIONS
@@ -661,7 +698,7 @@ def render_golden_solution(golden):
 def render_sidebar():
     with st.sidebar:
         st.markdown("## 🧬 Hybrid AI Framework")
-        st.markdown("---"); st.markdown(f"**Version:** v32.2-Pro-Full")
+        st.markdown("---"); st.markdown(f"**Version:** v32.3-Pro-Full")
         st.markdown(f"**Institution:** Nile Valley University")
         st.markdown("---")
         uploaded_file = st.file_uploader("Upload your dataset (CSV)", type=["csv"])
@@ -735,14 +772,14 @@ def run_real_optimization(progress_callback=None):
         efrf = float(pareto_obj[i, 2]) # Use shrunk value to ensure Golden matches curve perfectly
         if efrf < 0.40:
             quality = calculate_quality_score(pred[0], pred[1], efrf, api=row[0])
-            solutions.append({'Solution': f'S{i+1}', 'API (%)': row[0], 'EFRF': efrf, 'Density': pred[0], 'Tensile (MPa)': pred[1], 'Quality Score': quality['overall']})
+            solutions.append({'Solution': f'S{i+1}', 'API (%)': float(row[0]), 'EFRF': efrf, 'Density': float(pred[0]), 'Tensile (MPa)': float(pred[1]), 'Quality Score': float(quality['overall'])})
     solutions.sort(key=lambda x: x['Quality Score'], reverse=True)
-    if not solutions: return [], None, []
-    return solutions, solutions[0], gen_history
+    if not solutions: return [], None, [], None, None
+    return solutions, solutions[0], gen_history, final_pop, final_obj
 
 def main():
     render_sidebar()
-    st.markdown("# 🧬 Hybrid AI · v32.2 Pro-Full (PINN+Uncertainty+3D+Radar)")
+    st.markdown("# 🧬 Hybrid AI · v32.3 Pro-Full (PINN+Uncertainty+3D+Radar)")
     render_input_panel()
     run_button = st.button("🚀 Run Hybrid Optimization", type="primary", use_container_width=True)
 
@@ -754,7 +791,7 @@ def main():
         opt_progress = st.progress(0, text="Running NSGA-II generation 0/%d..." % NSGA_GENERATIONS)
         def _update_opt_progress(gen, total):
             opt_progress.progress((gen + 1) / total, text=f"Running NSGA-II generation {min(gen + 1, total)}/{total}...")
-        solutions, golden, gen_history = run_real_optimization(progress_callback=_update_opt_progress)
+        solutions, golden, gen_history, final_pop, final_obj = run_real_optimization(progress_callback=_update_opt_progress)
         opt_progress.empty()
         
         # Update Runtime and Session
@@ -763,6 +800,8 @@ def main():
         st.session_state.golden_solution = golden
         st.session_state.best_solutions = solutions
         st.session_state.pareto_history = gen_history
+        st.session_state.final_pareto_pop = final_pop
+        st.session_state.final_pareto_obj = final_obj
         
         # Compute Tested Formulation (Current Sliders) with Uncertainty
         n = normalize_formulation(st.session_state.api, st.session_state.binder, st.session_state.pvpp, st.session_state.mgst, st.session_state.mcc, st.session_state.moisture)
@@ -777,13 +816,17 @@ def main():
         
         # NEW: 3D and Radar
         st.subheader("🌐 3D Pareto Front & Radar Comparison")
-        if solutions:
-            final_pop = np.array([list(sol.values())[0:2] for sol in solutions]) # Dummy, just to pass
-            # Actually, we need final_pop and final_obj. We can build it from history or pass through.
-            # For UI consistency, we use the currently stored best solutions
+        if final_pop is not None and len(final_pop) > 0:
+            # Find golden idx based on the best solution from the list
+            golden_sol_api = golden['API (%)']
+            golden_idx = np.argmin(np.abs(final_pop[:, 0] - golden_sol_api))
+            
+            # Prepare tested_data for 3D plot
+            tested_data = {'api': tested_results['api'], 'efrf': tested_results['efrf'], 'tensile': tested_results['tensile']}
+            
             col_a, col_b = st.columns([1, 1])
             with col_a:
-                render_3d_pareto(np.array([s['API (%)'] for s in solutions]), np.array([s['EFRF'] for s in solutions]), 0)
+                render_3d_pareto(final_pop, final_obj, golden_idx, tested_data=tested_data)
             with col_b:
                 df = pd.DataFrame(solutions)
                 selected = st.multiselect("Select for Radar", df['Solution'], default=df['Solution'][:2].tolist())
