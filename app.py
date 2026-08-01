@@ -698,8 +698,8 @@ def run_real_optimization(progress_callback=None):
             })
     solutions.sort(key=lambda x: x['Quality Score'], reverse=True)
     if not solutions:
-        return [], None, []
-    return solutions, solutions[0], gen_history
+        return [], None, [], None, None
+    return solutions, solutions[0], gen_history, pareto_pop, pareto_obj
 
 def get_current_formulation_results():
     model = st.session_state.get('_trained_model')
@@ -1079,6 +1079,32 @@ def render_pareto_evolution():
         hovertemplate='API: %{x:.2f}%<br>EFRF: %{y:.3f}<extra></extra>'
     ))
 
+    # ---- NEW: Extension to limit 0.40 ----
+    if len(api_sorted) > 0 and cummax_efrf[-1] < 0.40:
+        last_api = api_sorted[-1]
+        last_efrf = cummax_efrf[-1]
+        # Draw a dashed line from the last Pareto point to the limit at 0.40
+        fig.add_trace(go.Scatter(
+            x=[last_api, last_api],
+            y=[last_efrf, 0.40],
+            mode='lines',
+            name='Front extension to limit',
+            line=dict(color='red', width=2, dash='dash'),
+            showlegend=True,
+            hovertemplate='Extension to EFRF=0.40<extra></extra>'
+        ))
+        # Add a marker at the limit point
+        fig.add_trace(go.Scatter(
+            x=[last_api],
+            y=[0.40],
+            mode='markers',
+            name='EFRF limit point',
+            marker=dict(size=8, color='red', symbol='cross'),
+            showlegend=True,
+            hovertemplate=f'API: {last_api:.2f}%<br>EFRF: 0.40<extra></extra>'
+        ))
+    # --------------------------------------
+
     # Golden solution (already feasible)
     if golden:
         fig.add_trace(go.Scatter(
@@ -1163,7 +1189,7 @@ def render_golden_solution(golden):
         st.success("✅ This formulation maximises API% and Tensile while preserving excellent tablet quality!")
 
 # ================================================================
-# NEW: DYNAMIC RADAR IMPLEMENTATION (Replaces old static 3-solution radar)
+# NEW: DYNAMIC RADAR IMPLEMENTATION
 # ================================================================
 def render_side_by_side_comparison(golden, all_solutions):
     if not golden or not all_solutions:
@@ -1370,31 +1396,77 @@ def main():
         def _update_opt_progress(gen, total):
             frac = min(1.0, max(0.0, (gen + 1) / total))
             opt_progress.progress(frac, text=f"Running NSGA-II generation {min(gen + 1, total)}/{total}...")
-        solutions, golden, gen_history = run_real_optimization(progress_callback=_update_opt_progress)
+        
+        # ---- MODIFIED: accept pareto_pop and pareto_obj ----
+        solutions, golden, gen_history, pareto_pop, pareto_obj = run_real_optimization(progress_callback=_update_opt_progress)
         opt_progress.empty()
+        
         st.session_state.results = get_current_formulation_results()
         st.session_state.golden_solution = golden
         st.session_state.best_solutions = solutions
         st.session_state.pareto_history = gen_history
         st.session_state.runtime = round(time.time() - start_time, 1)
 
-        render_results_summary(st.session_state.results)
-        render_pareto_evolution()
+        # ---- NEW: choose golden from Pareto front only ----
+        weights = np.array([st.session_state.sidebar_w_api if 'sidebar_w_api' in st.session_state else 0.4,
+                            st.session_state.sidebar_w_quality if 'sidebar_w_quality' in st.session_state else 0.6])
+        # Store weights from sidebar to session state for later use
+        st.session_state.sidebar_w_api = w_api
+        st.session_state.sidebar_w_quality = w_quality
         
-        # NEW: 3D Pareto (Collapsible to avoid clutter)
-        with st.expander("🌐 3D Pareto Front (API - EFRF - Tensile)", expanded=False):
-            # Extract pop/obj from history
-            last_entry = gen_history[-1]
-            final_pop = last_entry['population']
-            final_obj = last_entry['objectives']
-            # Find golden index within this population
-            golden_idx = None
-            if golden:
-                for i, row in enumerate(final_pop):
-                    if abs(row[0] - golden['API (%)']) < 0.01:
-                        golden_idx = i
-                        break
-            render_3d_pareto(final_pop, final_obj, golden_idx, tested_data=st.session_state.results)
+        # Compute scores only on Pareto solutions (pareto_pop, pareto_obj)
+        scores = []
+        for i in range(len(pareto_pop)):
+            s = (pareto_pop[i,0]/100 * weights[0]) + ((1 - pareto_obj[i].sum()/4) * weights[1])
+            scores.append(s)
+        golden_idx = np.argmax(scores)
+        best_sol = pareto_pop[golden_idx]
+        
+        # Predict uncertainty for the golden solution
+        pop_scaled = scaler.transform([best_sol])
+        preds, unc = model.predict_with_uncertainty(torch.tensor(pop_scaled, dtype=torch.float32))
+        preds, unc = preds[0], unc[0]
+        st.success(f"🏆 Golden Solution Found!\nAPI: {best_sol[0]:.2f}% | EFRF: {preds[2]:.3f} ± {unc[2]:.3f}")
+        st.caption(f"Optimization took {st.session_state.runtime:.2f} seconds.")
+
+        # 4. Compute Tested Formulation Data
+        slider_form = np.array([[api, binder, pvpp, mgst, mcc, moisture, pressure, speed]], dtype=np.float32)
+        slider_preds, _ = model.predict_with_uncertainty(torch.tensor(scaler.transform(slider_form), dtype=torch.float32))
+        tested_data = {'api': float(api), 'efrf': float(slider_preds[0][2]), 'tensile': float(slider_preds[0][1])}
+
+        # 5. Build Solutions DataFrame for Radar / Exports (from pareto solutions)
+        sol_list = []
+        sorted_indices = np.argsort([-scores[i] for i in range(len(pareto_pop))])
+        for idx in sorted_indices[:10]:
+            sol_list.append({
+                'Solution': f'S{idx+1}',
+                'API (%)': float(pareto_pop[idx, 0]),
+                'Density': float(-pareto_obj[idx, 0]),
+                'Tensile (MPa)': float(-pareto_obj[idx, 1]),
+                'EFRF': float(pareto_obj[idx, 2]),
+                'Quality Score': float(100 - (pareto_obj[idx].sum() * 20))
+            })
+        sol_df = pd.DataFrame(sol_list)
+        # Create simplified golden dict for plots
+        golden_plot = {'API (%)': best_sol[0], 'EFRF': preds[2]}
+
+        # 6. Render All Visualizations
+        st.subheader("🌐 2D Pareto Front (API vs EFRF)")
+        render_pareto_evolution()  # now uses session_state.golden_solution and pareto_history
+        
+        st.subheader("🌐 3D Pareto Front (API - EFRF - Tensile)")
+        # Use the last entry from gen_history to get the final Pareto front
+        last_entry = gen_history[-1]
+        final_pop_hist = last_entry['population']
+        final_obj_hist = last_entry['objectives']
+        # Find golden index within this population (by API match)
+        golden_idx_hist = None
+        if golden:
+            for i, row in enumerate(final_pop_hist):
+                if abs(row[0] - best_sol[0]) < 0.01:
+                    golden_idx_hist = i
+                    break
+        render_3d_pareto(final_pop_hist, final_obj_hist, golden_idx_hist, tested_data=tested_data)
 
         render_golden_solution(golden)
         render_side_by_side_comparison(golden, solutions)
