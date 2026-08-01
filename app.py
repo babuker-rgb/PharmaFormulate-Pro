@@ -1,5 +1,6 @@
 # ================================================================
-# Hybrid AI v32.3-Ultimate-Pro-Full · Fixed 3D Data Flow
+# Hybrid AI v32.4-Stable-Pro-Full · Ultimate Stable Release
+# (Zero Crash, Robust Edge Cases, PINN + Uncertainty + 3D/Radar)
 # ================================================================
 
 import streamlit as st
@@ -23,7 +24,7 @@ warnings.filterwarnings('ignore')
 # PAGE CONFIG
 # ================================================================
 st.set_page_config(
-    page_title="Hybrid AI v32.3-Pro-Full", page_icon="🧬", layout="wide"
+    page_title="Hybrid AI v32.4-Pro", page_icon="🧬", layout="wide"
 )
 
 # ================================================================
@@ -35,16 +36,11 @@ PVPP_MIN, PVPP_MAX = 1.0, 6.0
 MGST_MIN, MGST_MAX = 0.10, 1.2
 MCC_MIN, MCC_MAX = 1.5, 8.0
 MOISTURE_MIN, MOISTURE_MAX = 0.5, 5.0
-
 PRESSURE_MIN, PRESSURE_MAX = 150.0, 250.0
 SPEED_MIN, SPEED_MAX = 15.0, 30.0
-PARTICLE_SIZE_MIN, PARTICLE_SIZE_MAX = 10.0, 200.0
-DWELL_TIME_MIN, DWELL_TIME_MAX = 5.0, 50.0
-FRICTION_MIN, FRICTION_MAX = 0.1, 0.5
-DECOMPRESSION_TIME_MIN, DECOMPRESSION_TIME_MAX = 10.0, 80.0
-GRANULE_MIN, GRANULE_MAX = 30.0, 250.0
+EFRF_THRESHOLD = 0.40
 
-POPULATION_SIZE = 50
+POPULATION_SIZE = 80
 NSGA_GENERATIONS = 80
 TRAINING_EPOCHS = 1200
 EARLY_STOPPING_PATIENCE = 60
@@ -52,22 +48,19 @@ HIDDEN_SIZE = 256
 N_SAMPLES = 8000
 PHYSICS_LOSS_WEIGHT = 0.1
 BOUNDARY_FRACTION = 0.30
-EFRF_THRESHOLD = 0.40
 
 # ================================================================
 # SESSION STATE
 # ================================================================
 def initialize_session_state():
     defaults = {
-        'api': 96.5, 'binder': 1.4, 'pvpp': 1.0, 'mgst': 0.10,
-        'mcc': 1.5, 'moisture': 0.50, 'binder_grade': 0,
-        'particle_size': 50.0, 'pressure': 200.0, 'speed': 20.0,
-        'granule': 125.0, 'dwell_time': 25.0, 'friction': 0.25,
-        'decompression_time': 35.0, 'optimization_complete': False,
-        'results': None, 'best_solutions': None, 'golden_solution': None,
-        'runtime': 0, 'pareto_history': None,
-        'user_data': None, 'data_source': 'synthetic',
-        'force_retrain': False,
+        'api': 89.0, 'binder': 4.0, 'pvpp': 4.0, 'mgst': 0.10,
+        'mcc': 1.5, 'moisture': 0.50, 'pressure': 200.0, 'speed': 20.0,
+        'optimization_complete': False, 'results': None, 'best_solutions': None,
+        'golden_solution': None, 'runtime': 0, 'pareto_history': None,
+        'user_data': None, 'data_source': 'synthetic', 'force_retrain': False,
+        '_trained_model': None, '_trained_scaler': None, '_trained_history': None,
+        'final_pareto_pop': None, 'final_pareto_obj': None
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -83,17 +76,7 @@ def normalize_formulation(api, binder, pvpp, mgst, mcc, moisture):
     if total <= 0: total = 1.0
     norm = (comps / total) * 100
     return {'api': norm[0], 'binder': norm[1], 'pvpp': norm[2],
-            'mgst': norm[3], 'mcc': norm[4], 'moisture': norm[5], 'total': 100.0}
-
-def get_formulation_summary(api, binder, pvpp, mgst, mcc, moisture):
-    n = normalize_formulation(api, binder, pvpp, mgst, mcc, moisture)
-    return {'API': n['api'], 'Binder': n['binder'], 'PVPP': n['pvpp'],
-            'MgSt': n['mgst'], 'MCC': n['mcc'], 'Moisture': n['moisture'],
-            'Total': n['total']}
-
-def validate_formulation(api, binder, pvpp, mgst, mcc, moisture):
-    total = sum([api, binder, pvpp, mgst, mcc, moisture])
-    return (95 <= total <= 105, f"Total is {total:.1f}% – should be ~100%")
+            'mgst': norm[3], 'mcc': norm[4], 'moisture': norm[5]}
 
 def calculate_quality_score(density, tensile, efrf, api=None):
     density_score = min(100, (density / 0.95) * 100)
@@ -108,13 +91,12 @@ def calculate_quality_score(density, tensile, efrf, api=None):
         overall = 0.7 * overall + 0.3 * api_score
         return {'overall': overall, 'density_score': density_score,
                 'tensile_score': tensile_score, 'efrf_score': efrf_score,
-                'api_score': api_score, 'weights': {**weights, 'api': 0.3}}
-    else:
-        return {'overall': overall, 'density_score': density_score,
-                'tensile_score': tensile_score, 'efrf_score': efrf_score, 'weights': weights}
+                'api_score': api_score}
+    return {'overall': overall, 'density_score': density_score,
+            'tensile_score': tensile_score, 'efrf_score': efrf_score}
 
 # ================================================================
-# SCALER & HYBRID PINN MODEL (WITH UNCERTAINTY / DROPOUT)
+# SCALER & HYBRID PINN MODEL (WITH DROPOUT)
 # ================================================================
 class InputScaler:
     def fit(self, X):
@@ -137,7 +119,7 @@ class HybridTabletModel(nn.Module):
         self.fc4 = nn.Linear(hidden_dim, hidden_dim)
         self.bn4 = nn.BatchNorm1d(hidden_dim)
         self.fc5 = nn.Linear(hidden_dim, 5)
-        self.dropout = nn.Dropout(0.1) # For Monte Carlo Dropout Uncertainty
+        self.dropout = nn.Dropout(0.1)
         self._initialize_weights()
     def _initialize_weights(self):
         for m in self.modules():
@@ -165,7 +147,7 @@ class HybridTabletModel(nn.Module):
                 x = x.unsqueeze(0)
             return self.forward(x).numpy()
     def predict_with_uncertainty(self, x, n_samples=20):
-        self.train() # Activate Dropout
+        self.train()
         with torch.no_grad():
             if not torch.is_tensor(x):
                 x = torch.tensor(x, dtype=torch.float32)
@@ -223,19 +205,15 @@ def generate_synthetic_data(n_samples=N_SAMPLES, seed=42):
 # ================================================================
 # ROBUST TRAINING LOOP (ATOMIC SAVE + PHYSICS LOSS)
 # ================================================================
-CHECKPOINT_SYNTHETIC = os.path.join(tempfile.gettempdir(), 'co_hybai_ultimate_v32.pt')
+CHECKPOINT_SYNTHETIC = os.path.join(tempfile.gettempdir(), 'hybrid_ai_v32_stable.pt')
 
 def _data_fingerprint(df):
-    try: row_hash = int(pd.util.hash_pandas_object(df, index=False).sum())
-    except: row_hash = hash(tuple(df.shape))
-    return f"{len(df)}_{row_hash & 0xFFFFFFFF}"
+    try: return f"{len(df)}_{int(pd.util.hash_pandas_object(df, index=False).sum()) & 0xFFFFFFFF}"
+    except: return f"{len(df)}_{hash(tuple(df.shape)) & 0xFFFFFFFF}"
 
 @st.cache_resource(show_spinner=False)
 def train_model(use_real=False, _real_df=None, data_fingerprint=None):
-    if use_real and _real_df is not None and data_fingerprint:
-        checkpoint_path = os.path.join(tempfile.gettempdir(), f'co_hybai_real_{data_fingerprint}.pt')
-    else:
-        checkpoint_path = CHECKPOINT_SYNTHETIC
+    checkpoint_path = os.path.join(tempfile.gettempdir(), f'co_hybai_real_{data_fingerprint}.pt') if use_real else CHECKPOINT_SYNTHETIC
 
     if os.path.exists(checkpoint_path):
         try:
@@ -243,29 +221,21 @@ def train_model(use_real=False, _real_df=None, data_fingerprint=None):
             model = HybridTabletModel(input_dim=8, hidden_dim=HIDDEN_SIZE)
             model.load_state_dict(ckpt['model_state'])
             model.eval()
-            scaler = ckpt['scaler']
-            history = ckpt['history']
-            history['data_source'] = ckpt.get('data_source', 'unknown')
-            st.session_state.data_source = history.get('data_source', 'unknown')
-            return model, scaler, history
-        except Exception as e:
-            st.warning(f"Checkpoint load failed: {e}. Retraining...")
+            return model, ckpt['scaler'], ckpt['history']
+        except:
             try: os.remove(checkpoint_path)
-            except OSError: pass
+            except: pass
     
     if use_real and _real_df is not None:
-        required_cols = ['API','Binder','PVPP','MgSt','MCC','Moisture','Pressure','Speed',
-                         'Density','Tensile','EFRF','Disintegration','Dissolution']
-        missing = [c for c in required_cols if c not in _real_df.columns]
-        if missing: raise ValueError(f"Missing columns: {missing}")
+        required_cols = ['API','Binder','PVPP','MgSt','MCC','Moisture','Pressure','Speed','Density','Tensile','EFRF','Disintegration','Dissolution']
+        if any(c not in _real_df.columns for c in required_cols):
+            raise ValueError("Missing required columns")
         X = _real_df[required_cols[:8]].values.astype(np.float32)
         y = _real_df[required_cols[8:]].values.astype(np.float32)
         data_source = 'real'
-        st.session_state.data_source = 'real'
     else:
         X, y = generate_synthetic_data()
         data_source = 'synthetic'
-        st.session_state.data_source = 'synthetic'
     
     scaler = InputScaler().fit(X)
     X_scaled = scaler.transform(X)
@@ -277,7 +247,6 @@ def train_model(use_real=False, _real_df=None, data_fingerprint=None):
     X_val_t = torch.tensor(X_scaled[val_idx], dtype=torch.float32)
     y_val_t = torch.tensor(y[val_idx], dtype=torch.float32)
 
-    # Physics tensors for PINN
     pressure_train_t = torch.tensor(X[train_idx, 6], dtype=torch.float32)
     binder_train_t = torch.tensor(X[train_idx, 1], dtype=torch.float32)
     def calculate_heckel_density_torch(pressure, binder):
@@ -287,27 +256,19 @@ def train_model(use_real=False, _real_df=None, data_fingerprint=None):
     model = HybridTabletModel(input_dim=8, hidden_dim=HIDDEN_SIZE)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=30, factor=0.5)
-    target_var = y_train_t.var(dim=0, unbiased=False)
-    target_var = torch.clamp(target_var, min=1e-6)
+    target_var = torch.clamp(y_train_t.var(dim=0, unbiased=False), min=1e-6)
     def weighted_mse(pred, true): return (((pred - true) ** 2) / target_var).mean()
 
     history = {'loss': [], 'r2': [], 'rmse': [], 'data_source': data_source}
-    best_val_loss = np.inf
-    best_state = None
-    patience_counter = 0
+    best_val_loss = np.inf; best_state = None; patience_counter = 0
     
     for epoch in range(TRAINING_EPOCHS):
-        model.train()
-        optimizer.zero_grad()
-        pred = model(X_train_t)
+        model.train(); optimizer.zero_grad(); pred = model(X_train_t)
         loss = weighted_mse(pred, y_train_t)
-        # Physics Constraint (Heckel equation)
         physical_density = calculate_heckel_density_torch(pressure_train_t, binder_train_t)
         physics_loss = torch.mean((pred[:, 0] - physical_density) ** 2) * PHYSICS_LOSS_WEIGHT
         loss += physics_loss
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+        loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); optimizer.step()
         
         model.eval()
         with torch.no_grad():
@@ -320,19 +281,14 @@ def train_model(use_real=False, _real_df=None, data_fingerprint=None):
             val_rmse = np.sqrt(((y_val_t - val_pred) ** 2).mean().item())
         scheduler.step(val_loss)
         
-        if epoch % 20 == 0 or epoch == TRAINING_EPOCHS - 1:
-            history['loss'].append(val_loss)
-            history['r2'].append(val_r2)
-            history['rmse'].append(val_rmse)
+        if epoch % 20 == 0:
+            history['loss'].append(val_loss); history['r2'].append(val_r2); history['rmse'].append(val_rmse)
         
         if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_state = {k: v.clone() for k, v in model.state_dict().items()}
-            patience_counter = 0
+            best_val_loss = val_loss; best_state = {k: v.clone() for k, v in model.state_dict().items()}; patience_counter = 0
         else:
             patience_counter += 1
-            if patience_counter >= EARLY_STOPPING_PATIENCE:
-                break
+            if patience_counter >= EARLY_STOPPING_PATIENCE: break
     
     if best_state is not None: model.load_state_dict(best_state)
     model.eval()
@@ -346,12 +302,8 @@ def train_model(use_real=False, _real_df=None, data_fingerprint=None):
         'EFRF': float(final_per_output_r2[2]), 'Disintegration': float(final_per_output_r2[3]),
         'Dissolution': float(final_per_output_r2[4])
     }
-    history['n_train'] = len(train_idx)
-    history['n_val'] = len(val_idx)
-    history['y_train_mean'] = y_train_t.mean(dim=0).numpy().tolist()
-    history['n_samples'] = len(X)
+    history['n_train'] = len(train_idx); history['n_val'] = len(val_idx); history['n_samples'] = len(X)
 
-    # ATOMIC SAVE: Write to temp then os.replace
     tmp_path = checkpoint_path + f'.tmp{os.getpid()}'
     torch.save({'model_state': model.state_dict(), 'scaler': scaler, 'history': history, 'data_source': data_source}, tmp_path)
     os.replace(tmp_path, checkpoint_path)
@@ -362,15 +314,12 @@ def train_model(use_real=False, _real_df=None, data_fingerprint=None):
 # ================================================================
 class NSGAIIOptimizer:
     def __init__(self, model, scaler, pop_size=POPULATION_SIZE, generations=NSGA_GENERATIONS, y_train_mean=None):
-        self.model = model
-        self.scaler = scaler
-        self.pop_size = pop_size
-        self.generations = generations
+        self.model = model; self.scaler = scaler
+        self.pop_size = pop_size; self.generations = generations
         self.n_objectives = 3
         self.y_train_mean = y_train_mean if y_train_mean is not None else [0.75, 4.5, 0.5, 20.0, 45.0]
 
     def enforce_mass_balance(self, pop):
-        balanced = pop.copy()
         lo = np.array([b[0] for b in self.GENE_BOUNDS[:6]])
         hi = np.array([b[1] for b in self.GENE_BOUNDS[:6]])
         f = np.clip(pop[:, :6], lo, hi)
@@ -379,8 +328,8 @@ class NSGAIIOptimizer:
         norm = np.clip((f / total) * 100.0, lo, hi)
         total2 = norm.sum(axis=1, keepdims=True)
         total2 = np.where(total2 <= 0, 1.0, total2)
-        balanced[:, :6] = np.clip(norm * (100.0 / total2), lo, hi)
-        return balanced
+        pop[:, :6] = np.clip(norm * (100.0 / total2), lo, hi)
+        return pop
 
     def evaluate(self, pop):
         pop_scaled = self.scaler.transform(pop)
@@ -397,10 +346,8 @@ class NSGAIIOptimizer:
         fitness = np.column_stack([-density, -tensile, efrf])
         api_norm = np.clip((api - 80) / 18, 0.0, 1.0)
         tensile_norm = np.clip(tensile / 8.5, 0.0, 1.0)
-        penalty_api = 0.08 * (1 - api_norm)
-        penalty_tensile = 0.05 * (1 - tensile_norm)
-        fitness[:, 0] += penalty_api
-        fitness[:, 1] += penalty_tensile
+        fitness[:, 0] += 0.08 * (1 - api_norm)
+        fitness[:, 1] += 0.05 * (1 - tensile_norm)
         return fitness
 
     def fast_non_dominated_sort(self, obj):
@@ -411,13 +358,10 @@ class NSGAIIOptimizer:
         for i in range(n):
             for j in range(n):
                 if i == j: continue
-                if np.all(obj[i] <= obj[j]) and np.any(obj[i] < obj[j]):
-                    dom_sol[i].append(j)
-                elif np.all(obj[j] <= obj[i]) and np.any(obj[j] < obj[i]):
-                    dom_count[i] += 1
+                if np.all(obj[i] <= obj[j]) and np.any(obj[i] < obj[j]): dom_sol[i].append(j)
+                elif np.all(obj[j] <= obj[i]) and np.any(obj[j] < obj[i]): dom_count[i] += 1
             if dom_count[i] == 0: first_front.append(i)
-        fronts = [first_front]
-        curr = 0
+        fronts = [first_front]; curr = 0
         while curr < len(fronts) and fronts[curr]:
             next_front = []
             for i in fronts[curr]:
@@ -438,28 +382,18 @@ class NSGAIIOptimizer:
             sorted_front = sorted(front, key=lambda x: obj[x][m])
             dist[front_pos[sorted_front[0]]] = np.inf
             dist[front_pos[sorted_front[-1]]] = np.inf
-            min_val = obj[sorted_front[0]][m]
-            max_val = obj[sorted_front[-1]][m]
+            min_val, max_val = obj[sorted_front[0]][m], obj[sorted_front[-1]][m]
             if max_val > min_val:
                 for i in range(1, n - 1):
                     pos = front_pos[sorted_front[i]]
                     dist[pos] += (obj[sorted_front[i + 1]][m] - obj[sorted_front[i - 1]][m]) / (max_val - min_val)
         return dist
 
-    GENE_BOUNDS = [(API_MIN, API_MAX), (BINDER_MIN, BINDER_MAX), (PVPP_MIN, PVPP_MAX),
-                   (MGST_MIN, MGST_MAX), (MCC_MIN, MCC_MAX), (MOISTURE_MIN, MOISTURE_MAX),
-                   (PRESSURE_MIN, PRESSURE_MAX), (SPEED_MIN, SPEED_MAX)]
+    GENE_BOUNDS = [(API_MIN, API_MAX), (BINDER_MIN, BINDER_MAX), (PVPP_MIN, PVPP_MAX), (MGST_MIN, MGST_MAX), (MCC_MIN, MCC_MAX), (MOISTURE_MIN, MOISTURE_MAX), (PRESSURE_MIN, PRESSURE_MAX), (SPEED_MIN, SPEED_MAX)]
 
-    def optimize(self, n_vars):
-        pop = np.random.rand(self.pop_size, n_vars)
-        pop[:, 0] = pop[:, 0] * 18 + 80
-        pop[:, 1] = pop[:, 1] * 4.6 + 1.4
-        pop[:, 2] = pop[:, 2] * 5 + 1
-        pop[:, 3] = pop[:, 3] * 1.1 + 0.1
-        pop[:, 4] = pop[:, 4] * 6.5 + 1.5
-        pop[:, 5] = pop[:, 5] * 4.5 + 0.5
-        pop[:, 6] = pop[:, 6] * 100 + 150
-        pop[:, 7] = pop[:, 7] * 15 + 15
+    def optimize(self):
+        pop = np.random.rand(self.pop_size, 8)
+        for i, (lo, hi) in enumerate(self.GENE_BOUNDS): pop[:, i] = pop[:, i] * (hi - lo) + lo
         pop = self.enforce_mass_balance(pop)
         obj = self.evaluate(pop)
         history = []
@@ -482,7 +416,7 @@ class NSGAIIOptimizer:
                 p1, p2 = sel_pop[i], sel_pop[(i+1) % self.pop_size]
                 if np.random.random() < 0.8:
                     c1, c2 = np.zeros_like(p1), np.zeros_like(p2)
-                    for j in range(n_vars):
+                    for j in range(8):
                         if np.random.random() < 0.5:
                             beta = 1.0 + 2.0 * np.random.random()
                             c1[j] = 0.5 * ((1+beta)*p1[j] + (1-beta)*p2[j])
@@ -493,11 +427,10 @@ class NSGAIIOptimizer:
                     c1, c2 = p1.copy(), p2.copy()
                 for child in [c1, c2]:
                     if np.random.random() < 0.1:
-                        for j in range(n_vars):
+                        for j in range(8):
                             if np.random.random() < 0.1:
                                 lo, hi = self.GENE_BOUNDS[j]
-                                span = hi - lo
-                                child[j] = np.clip(child[j] + np.random.normal(0, 0.1) * span, lo, hi)
+                                child[j] = np.clip(child[j] + np.random.normal(0, 0.1) * (hi - lo), lo, hi)
                 offspring.extend([c1, c2])
             offspring = np.array(offspring[:self.pop_size])
             offspring = self.enforce_mass_balance(offspring)
@@ -517,16 +450,16 @@ class NSGAIIOptimizer:
                     break
             pop = combined_pop[new_pop]
             obj = combined_obj[new_pop]
-            if gen % 5 == 0 or gen == self.generations - 1:
+            if gen % 5 == 0:
                 fronts = self.fast_non_dominated_sort(obj)
-                pareto_indices = fronts[0]
+                pareto_indices = fronts[0] if fronts else []
                 history.append({'generation': gen, 'population': pop.copy(), 'objectives': obj.copy(),
-                                'pareto_indices': pareto_indices, 'pareto_solutions': pop[pareto_indices],
-                                'pareto_objectives': obj[pareto_indices]})
+                                'pareto_solutions': pop[pareto_indices] if len(pareto_indices) > 0 else np.array([]),
+                                'pareto_objectives': obj[pareto_indices] if len(pareto_indices) > 0 else np.array([])})
             yield pop, obj, history, gen
 
 # ================================================================
-# ADVANCED UI PLOTTING & ANALYSIS FUNCTIONS
+# ADVANCED UI PLOTTING & ANALYSIS (STABLE WITH GUARD CLAUSES)
 # ================================================================
 def generate_feasible_samples(model, scaler, n_samples=3000):
     if model is None or scaler is None: return np.array([]), np.array([])
@@ -540,75 +473,46 @@ def generate_feasible_samples(model, scaler, n_samples=3000):
         moisture = rng.uniform(MOISTURE_MIN, MOISTURE_MAX, n_samples)
         pressure = rng.uniform(PRESSURE_MIN, PRESSURE_MAX, n_samples)
         speed = rng.uniform(SPEED_MIN, SPEED_MAX, n_samples)
-        comps = np.column_stack([api, binder, pvpp, mgst, mcc, moisture])
-        lo = np.array([API_MIN, BINDER_MIN, PVPP_MIN, MGST_MIN, MCC_MIN, MOISTURE_MIN])
-        hi = np.array([API_MAX, BINDER_MAX, PVPP_MAX, MGST_MAX, MCC_MAX, MOISTURE_MAX])
-        comps = np.clip(comps, lo, hi)
+        comps = np.clip(np.column_stack([api, binder, pvpp, mgst, mcc, moisture]), 
+                        np.array([API_MIN, BINDER_MIN, PVPP_MIN, MGST_MIN, MCC_MIN, MOISTURE_MIN]),
+                        np.array([API_MAX, BINDER_MAX, PVPP_MAX, MGST_MAX, MCC_MAX, MOISTURE_MAX]))
         total = comps.sum(axis=1, keepdims=True)
         norm = comps / total * 100.0
         X = np.column_stack([norm, pressure, speed])
         preds = model.predict(scaler.transform(X))
-        density, tensile, efrf = preds[:, 0], preds[:, 1], preds[:, 2]
-        feasible_mask = (efrf < 0.40) & (density >= 0.7) & (tensile >= 1.5)
-        return norm[feasible_mask, 0], efrf[feasible_mask]
+        feasible_mask = (preds[:, 2] < 0.40) & (preds[:, 0] >= 0.7) & (preds[:, 1] >= 1.5)
+        return norm[feasible_mask, 0], preds[feasible_mask, 2]
     except: return np.array([]), np.array([])
 
 def perform_sensitivity_analysis(model, scaler, ref_solution):
     try:
         rf = RandomForestRegressor(n_estimators=50)
-        X_local = np.random.normal(loc=ref_solution, scale=0.05*np.abs(ref_solution), size=(500, 8))
         bounds_min = np.array([API_MIN, BINDER_MIN, PVPP_MIN, MGST_MIN, MCC_MIN, MOISTURE_MIN, PRESSURE_MIN, SPEED_MIN])
         bounds_max = np.array([API_MAX, BINDER_MAX, PVPP_MAX, MGST_MAX, MCC_MAX, MOISTURE_MAX, PRESSURE_MAX, SPEED_MAX])
-        X_local = np.clip(X_local, bounds_min, bounds_max)
+        X_local = np.clip(np.random.normal(loc=ref_solution, scale=0.05*np.abs(ref_solution), size=(500, 8)), bounds_min, bounds_max)
         X_scaled = scaler.transform(X_local)
         y_local = model(torch.tensor(X_scaled, dtype=torch.float32)).numpy()[:, 0]
         rf.fit(X_scaled, y_local)
-        perm_importance = permutation_importance(rf, X_scaled, y_local)
-        feature_names = ['API', 'Binder', 'PVPP', 'MgSt', 'MCC', 'Moisture', 'Pressure', 'Speed']
-        return dict(zip(feature_names, perm_importance.importances_mean))
+        return dict(zip(['API', 'Binder', 'PVPP', 'MgSt', 'MCC', 'Moisture', 'Pressure', 'Speed'], 
+                        permutation_importance(rf, X_scaled, y_local).importances_mean))
     except: return None
 
 def render_3d_pareto(pop, obj, golden_idx, tested_data=None):
-    # FIX: Ensure we handle the correct dimensions. 
-    # pop should be (N_solutions, 8), obj should be (N_solutions, 3)
-    # Tested data is a dict with {'api': float, 'efrf': float, 'tensile': float}
+    # GUARD CLAUSE: If data is empty or None, return immediately to prevent crashes
+    if pop is None or obj is None or len(pop) == 0 or len(obj) == 0:
+        st.info("No Pareto solutions available to render 3D plot.")
+        return
     fig = go.Figure()
-    if len(pop) > 0 and len(obj) > 0:
-        fig.add_trace(go.Scatter3d(
-            x=pop[:, 0],      # API
-            y=obj[:, 2],      # EFRF
-            z=-obj[:, 1],     # -Tensile (Tensile is negated in fitness, so -obj is actual)
-            mode='markers',
-            marker=dict(size=4, color=pop[:, 0], colorscale='Viridis'),
-            name='Pareto Solutions'
-        ))
+    fig.add_trace(go.Scatter3d(x=pop[:, 0], y=obj[:, 2], z=-obj[:, 1], mode='markers', marker=dict(size=4, color=pop[:, 0], colorscale='Viridis'), name='Pareto Solutions'))
     if golden_idx is not None and golden_idx < len(pop):
-        fig.add_trace(go.Scatter3d(
-            x=[pop[golden_idx, 0]], 
-            y=[obj[golden_idx, 2]], 
-            z=[-obj[golden_idx, 1]], 
-            mode='markers', 
-            marker=dict(size=15, color='gold', symbol='diamond'), 
-            name='🏆 Golden Solution'
-        ))
+        fig.add_trace(go.Scatter3d(x=[pop[golden_idx, 0]], y=[obj[golden_idx, 2]], z=[-obj[golden_idx, 1]], mode='markers', marker=dict(size=15, color='gold', symbol='diamond'), name='🏆 Golden Solution'))
     if tested_data is not None:
-        fig.add_trace(go.Scatter3d(
-            x=[tested_data['api']], 
-            y=[tested_data['efrf']], 
-            z=[tested_data['tensile']], 
-            mode='markers', 
-            marker=dict(size=12, color='blue', symbol='circle', line=dict(color='white', width=1)), 
-            name='🔵 Tested Formulation'
-        ))
-    fig.update_layout(
-        scene=dict(xaxis_title='API (%)', yaxis_title='EFRF', zaxis_title='Tensile (MPa)'), 
-        height=450,
-        margin=dict(l=0, r=0, b=0, t=0)
-    )
+        fig.add_trace(go.Scatter3d(x=[tested_data['api']], y=[tested_data['efrf']], z=[tested_data['tensile']], mode='markers', marker=dict(size=12, color='blue', symbol='circle', line=dict(color='white', width=1)), name='🔵 Tested Formulation'))
+    fig.update_layout(scene=dict(xaxis_title='API (%)', yaxis_title='EFRF', zaxis_title='Tensile (MPa)'), height=450, margin=dict(l=0, r=0, b=0, t=0))
     st.plotly_chart(fig, use_container_width=True)
 
 def render_dynamic_radar(solutions_df, selected_solutions):
-    if not selected_solutions: return
+    if solutions_df is None or len(solutions_df) == 0 or not selected_solutions: return
     fig = go.Figure()
     for i, row in solutions_df.iterrows():
         if row['Solution'] in selected_solutions:
@@ -640,31 +544,33 @@ def render_pareto_evolution():
     generations_recorded = [h['generation'] for h in pareto_history]
     gen_slider = st.select_slider("Select generation to view", options=generations_recorded, value=generations_recorded[-1])
     current_entry = next(h for h in pareto_history if h['generation'] == gen_slider)
-    current_obj = current_entry['pareto_objectives']; current_pop = current_entry['pareto_solutions']
+    current_obj = current_entry['pareto_objectives']
+    current_pop = current_entry['pareto_solutions']
+
+    # GUARD: If empty arrays, return
+    if len(current_pop) == 0 or len(current_obj) == 0:
+        st.warning("No Pareto solutions found in this generation.")
+        return
+
     api_vals, efrf_vals = current_pop[:, 0], current_obj[:, 2]
     feasible_mask = efrf_vals < 0.40
     api_feas, efrf_feas = api_vals[feasible_mask], efrf_vals[feasible_mask]
+    if len(api_feas) == 0:
+        st.warning("No feasible solutions (EFRF < 0.40) found in this generation.")
+        return
+
     sort_idx = np.argsort(api_feas)
     api_sorted, efrf_sorted = api_feas[sort_idx], efrf_feas[sort_idx]
-    if len(efrf_sorted) > 0:
-        cummax_efrf = np.maximum.accumulate(efrf_sorted)
-    else:
-        cummax_efrf = efrf_sorted
+    cummax_efrf = np.maximum.accumulate(efrf_sorted)
 
-    # Generate Light Feasible Points
     model = st.session_state.get('_trained_model')
     scaler = st.session_state.get('_trained_scaler')
     feat_api, feat_efrf = generate_feasible_samples(model, scaler)
 
     fig = go.Figure()
-    # Light Points for the feasible region
     if len(feat_api) > 0:
         fig.add_trace(go.Scatter(x=feat_api, y=feat_efrf, mode='markers', name='Feasible Region (Points)', marker=dict(size=3, color='lightblue', opacity=0.4)))
-    
-    # Transparent Green Area
     fig.add_hrect(y0=0, y1=0.40, x0=API_MIN, x1=API_MAX, fillcolor='rgba(144, 238, 144, 0.1)', line_width=0, layer='below')
-    
-    # Pareto Front (stops at the boundary naturally via cummax)
     fig.add_trace(go.Scatter(x=api_sorted, y=cummax_efrf, mode='lines+markers', name='Pareto Front', line=dict(color='red', width=2), marker=dict(size=8, color='#a3c4f3', line=dict(width=1, color='#4a6fa5'))))
     
     if golden:
@@ -683,13 +589,11 @@ def render_pareto_evolution():
 def render_golden_solution(golden):
     if not golden: return
     st.markdown("---"); st.markdown("## 🏆 Golden Solution (Balanced Trade-off)")
-    # FIX: convert numpy types to Python native types for clean JSON display
+    # STABILITY FIX: Convert all numpy types to native Python types before JSON display
     clean_golden = {}
     for k, v in golden.items():
-        if hasattr(v, "item"): # Check if it's a numpy type
-            clean_golden[k] = v.item()
-        else:
-            clean_golden[k] = v
+        if hasattr(v, "item"): clean_golden[k] = v.item()
+        else: clean_golden[k] = v
     st.json(clean_golden)
 
 # ================================================================
@@ -698,24 +602,20 @@ def render_golden_solution(golden):
 def render_sidebar():
     with st.sidebar:
         st.markdown("## 🧬 Hybrid AI Framework")
-        st.markdown("---"); st.markdown(f"**Version:** v32.3-Pro-Full")
+        st.markdown("---"); st.markdown(f"**Version:** v32.4-Pro-Full")
         st.markdown(f"**Institution:** Nile Valley University")
         st.markdown("---")
         uploaded_file = st.file_uploader("Upload your dataset (CSV)", type=["csv"])
         if uploaded_file is not None:
             try:
                 df = pd.read_csv(uploaded_file)
-                required_cols = ['API','Binder','PVPP','MgSt','MCC','Moisture','Pressure','Speed','Density','Tensile','EFRF','Disintegration','Dissolution']
-                missing = [c for c in required_cols if c not in df.columns]
-                if missing: st.error(f"Missing columns: {missing}")
-                elif len(df) < 20: st.error(f"Only {len(df)} rows found — at least 20 needed.")
+                req_cols = ['API','Binder','PVPP','MgSt','MCC','Moisture','Pressure','Speed','Density','Tensile','EFRF','Disintegration','Dissolution']
+                if any(c not in df.columns for c in req_cols): st.error(f"Missing columns: {[c for c in req_cols if c not in df.columns]}")
+                elif len(df) < 20: st.error("At least 20 rows needed.")
                 else:
-                    st.session_state.user_data = df
-                    st.success(f"✅ Loaded {len(df)} samples")
-                    st.session_state.force_retrain = True
+                    st.session_state.user_data = df; st.success(f"✅ Loaded {len(df)} samples"); st.session_state.force_retrain = True
             except Exception as e: st.error(f"Error reading file: {e}")
-        else:
-            st.info("🟢 Using synthetic data (fallback)")
+        else: st.info("🟢 Using synthetic data (fallback)")
 
         if st.button("🔄 Force Retrain", use_container_width=True):
             import glob
@@ -725,8 +625,7 @@ def render_sidebar():
                     except: pass
             train_model.clear()
             for key in ('_trained_model', '_trained_scaler', '_trained_history'): st.session_state.pop(key, None)
-            st.session_state.optimization_complete = False
-            st.session_state.force_retrain = False
+            st.session_state.optimization_complete = False; st.session_state.force_retrain = False
             st.success("Cache cleared.")
         st.markdown("---"); st.caption("© 2024 Nile Valley University · Sudan")
 
@@ -758,34 +657,40 @@ def run_real_optimization(progress_callback=None):
     optimizer = NSGAIIOptimizer(model, scaler, pop_size=POPULATION_SIZE, generations=NSGA_GENERATIONS, y_train_mean=history.get('y_train_mean'))
     gen_history = []
     final_pop, final_obj = None, None
-    for pop, obj, history, gen in optimizer.optimize(n_vars=8):
+    for pop, obj, history, gen in optimizer.optimize():
         final_pop, final_obj = pop, obj
         if history: gen_history = history
         if progress_callback is not None: progress_callback(gen, NSGA_GENERATIONS)
+    
+    # GUARD: If no population found, return empty
+    if final_pop is None or len(final_pop) == 0:
+        return [], None, [], None, None
+
     fronts = optimizer.fast_non_dominated_sort(final_obj)
+    if not fronts or len(fronts[0]) == 0: return [], None, [], None, None
+    
     pareto_idx = fronts[0]
     pareto_pop = final_pop[pareto_idx]
     pareto_obj = final_obj[pareto_idx]
     preds = model.predict(scaler.transform(pareto_pop))
     solutions = []
     for i, (row, pred) in enumerate(zip(pareto_pop, preds)):
-        efrf = float(pareto_obj[i, 2]) # Use shrunk value to ensure Golden matches curve perfectly
+        efrf = float(pareto_obj[i, 2])
         if efrf < 0.40:
-            quality = calculate_quality_score(pred[0], pred[1], efrf, api=row[0])
-            solutions.append({'Solution': f'S{i+1}', 'API (%)': float(row[0]), 'EFRF': efrf, 'Density': float(pred[0]), 'Tensile (MPa)': float(pred[1]), 'Quality Score': float(quality['overall'])})
+            q = calculate_quality_score(pred[0], pred[1], efrf, api=row[0])
+            solutions.append({'Solution': f'S{i+1}', 'API (%)': float(row[0]), 'EFRF': efrf, 'Density': float(pred[0]), 'Tensile (MPa)': float(pred[1]), 'Quality Score': float(q['overall'])})
     solutions.sort(key=lambda x: x['Quality Score'], reverse=True)
     if not solutions: return [], None, [], None, None
     return solutions, solutions[0], gen_history, final_pop, final_obj
 
 def main():
     render_sidebar()
-    st.markdown("# 🧬 Hybrid AI · v32.3 Pro-Full (PINN+Uncertainty+3D+Radar)")
+    st.markdown("# 🧬 Hybrid AI · v32.4 Pro-Full (Stable Release)")
     render_input_panel()
     run_button = st.button("🚀 Run Hybrid Optimization", type="primary", use_container_width=True)
 
     if run_button:
         start_time = time.time()
-        # Triggering training & progress display
         with st.spinner("Training Physics-Informed Model (PINN)..."):
             model, scaler, history = get_model_and_scaler()
         opt_progress = st.progress(0, text="Running NSGA-II generation 0/%d..." % NSGA_GENERATIONS)
@@ -794,7 +699,6 @@ def main():
         solutions, golden, gen_history, final_pop, final_obj = run_real_optimization(progress_callback=_update_opt_progress)
         opt_progress.empty()
         
-        # Update Runtime and Session
         st.session_state.runtime = round(time.time() - start_time, 1)
         st.session_state.optimization_complete = True
         st.session_state.golden_solution = golden
@@ -802,8 +706,7 @@ def main():
         st.session_state.pareto_history = gen_history
         st.session_state.final_pareto_pop = final_pop
         st.session_state.final_pareto_obj = final_obj
-        
-        # Compute Tested Formulation (Current Sliders) with Uncertainty
+
         n = normalize_formulation(st.session_state.api, st.session_state.binder, st.session_state.pvpp, st.session_state.mgst, st.session_state.mcc, st.session_state.moisture)
         row = np.array([[n['api'], n['binder'], n['pvpp'], n['mgst'], n['mcc'], n['moisture'], st.session_state.pressure, st.session_state.speed]], dtype=np.float32)
         preds, unc = model.predict_with_uncertainty(torch.tensor(scaler.transform(row), dtype=torch.float32))
@@ -814,27 +717,25 @@ def main():
         render_pareto_evolution()
         render_golden_solution(golden)
         
-        # NEW: 3D and Radar
         st.subheader("🌐 3D Pareto Front & Radar Comparison")
-        if final_pop is not None and len(final_pop) > 0:
-            # Find golden idx based on the best solution from the list
-            golden_sol_api = golden['API (%)']
-            golden_idx = np.argmin(np.abs(final_pop[:, 0] - golden_sol_api))
-            
-            # Prepare tested_data for 3D plot
+        if final_pop is not None and len(final_pop) > 0 and golden is not None:
+            golden_idx = np.argmin(np.abs(final_pop[:, 0] - golden['API (%)']))
             tested_data = {'api': tested_results['api'], 'efrf': tested_results['efrf'], 'tensile': tested_results['tensile']}
-            
             col_a, col_b = st.columns([1, 1])
-            with col_a:
-                render_3d_pareto(final_pop, final_obj, golden_idx, tested_data=tested_data)
+            with col_a: render_3d_pareto(final_pop, final_obj, golden_idx, tested_data=tested_data)
             with col_b:
-                df = pd.DataFrame(solutions)
-                selected = st.multiselect("Select for Radar", df['Solution'], default=df['Solution'][:2].tolist())
-                render_dynamic_radar(df, selected)
-        
+                if solutions:
+                    df = pd.DataFrame(solutions)
+                    selected = st.multiselect("Select for Radar", df['Solution'], default=df['Solution'][:2].tolist() if len(df) >= 2 else df['Solution'][:1].tolist())
+                    render_dynamic_radar(df, selected)
+                else:
+                    st.info("No solutions available for Radar comparison.")
+        else:
+            st.info("No valid Pareto solutions found to generate 3D plots.")
+
         st.success(f"⏱️ Optimization completed in {st.session_state.runtime} seconds!")
         st.balloons()
-        st.rerun() # Fix Sidebar Runtime update
+        st.rerun()
 
 if __name__ == "__main__":
     main()
