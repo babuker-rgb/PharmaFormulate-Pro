@@ -824,6 +824,11 @@ def render_sidebar():
         st.markdown("---")
         st.caption("© 2024 Nile Valley University · Sudan")
 
+    # Return weights to main scope
+    w_api = st.sidebar.slider("Weight for API", 0.0, 1.0, 0.4)
+    w_quality = st.sidebar.slider("Weight for Quality", 0.0, 1.0, 0.6)
+    return w_api, w_quality
+
 def render_binder_grade_comparison():
     st.markdown("---")
     st.markdown("## 🔬 Binder Grade Impact")
@@ -1079,7 +1084,7 @@ def render_pareto_evolution():
         hovertemplate='API: %{x:.2f}%<br>EFRF: %{y:.3f}<extra></extra>'
     ))
 
-    # ---- NEW: Extension to limit 0.40 ----
+    # ---- EXTENSION TO LIMIT 0.40 ----
     if len(api_sorted) > 0 and cummax_efrf[-1] < 0.40:
         last_api = api_sorted[-1]
         last_efrf = cummax_efrf[-1]
@@ -1189,7 +1194,7 @@ def render_golden_solution(golden):
         st.success("✅ This formulation maximises API% and Tensile while preserving excellent tablet quality!")
 
 # ================================================================
-# NEW: DYNAMIC RADAR IMPLEMENTATION
+# DYNAMIC RADAR IMPLEMENTATION
 # ================================================================
 def render_side_by_side_comparison(golden, all_solutions):
     if not golden or not all_solutions:
@@ -1350,7 +1355,9 @@ def render_optimization_summary():
 # MAIN ORCHESTRATION
 # ================================================================
 def main():
-    render_sidebar()
+    # FIX: Assign the return values from render_sidebar correctly!
+    w_api, w_quality = render_sidebar()
+    
     st.markdown("# 🧬 Hybrid AI · Multi-Objective Tablet Optimization")
     st.markdown("#### Nile Valley University · Sudan · v32.1-Integrated")
     st.markdown("---")
@@ -1397,7 +1404,6 @@ def main():
             frac = min(1.0, max(0.0, (gen + 1) / total))
             opt_progress.progress(frac, text=f"Running NSGA-II generation {min(gen + 1, total)}/{total}...")
         
-        # ---- MODIFIED: accept pareto_pop and pareto_obj ----
         solutions, golden, gen_history, pareto_pop, pareto_obj = run_real_optimization(progress_callback=_update_opt_progress)
         opt_progress.empty()
         
@@ -1407,14 +1413,12 @@ def main():
         st.session_state.pareto_history = gen_history
         st.session_state.runtime = round(time.time() - start_time, 1)
 
-        # ---- NEW: choose golden from Pareto front only ----
-        weights = np.array([st.session_state.sidebar_w_api if 'sidebar_w_api' in st.session_state else 0.4,
-                            st.session_state.sidebar_w_quality if 'sidebar_w_quality' in st.session_state else 0.6])
-        # Store weights from sidebar to session state for later use
+        # Store weights safely for future use
         st.session_state.sidebar_w_api = w_api
         st.session_state.sidebar_w_quality = w_quality
         
-        # Compute scores only on Pareto solutions (pareto_pop, pareto_obj)
+        # Calculate Golden solution ONLY from Pareto Front solutions (pareto_pop, pareto_obj)
+        weights = np.array([w_api, w_quality])
         scores = []
         for i in range(len(pareto_pop)):
             s = (pareto_pop[i,0]/100 * weights[0]) + ((1 - pareto_obj[i].sum()/4) * weights[1])
@@ -1429,12 +1433,12 @@ def main():
         st.success(f"🏆 Golden Solution Found!\nAPI: {best_sol[0]:.2f}% | EFRF: {preds[2]:.3f} ± {unc[2]:.3f}")
         st.caption(f"Optimization took {st.session_state.runtime:.2f} seconds.")
 
-        # 4. Compute Tested Formulation Data
+        # Compute Tested Formulation Data
         slider_form = np.array([[api, binder, pvpp, mgst, mcc, moisture, pressure, speed]], dtype=np.float32)
         slider_preds, _ = model.predict_with_uncertainty(torch.tensor(scaler.transform(slider_form), dtype=torch.float32))
         tested_data = {'api': float(api), 'efrf': float(slider_preds[0][2]), 'tensile': float(slider_preds[0][1])}
 
-        # 5. Build Solutions DataFrame for Radar / Exports (from pareto solutions)
+        # Build Solutions DataFrame for Radar / Exports (from pareto solutions)
         sol_list = []
         sorted_indices = np.argsort([-scores[i] for i in range(len(pareto_pop))])
         for idx in sorted_indices[:10]:
@@ -1447,19 +1451,16 @@ def main():
                 'Quality Score': float(100 - (pareto_obj[idx].sum() * 20))
             })
         sol_df = pd.DataFrame(sol_list)
-        # Create simplified golden dict for plots
         golden_plot = {'API (%)': best_sol[0], 'EFRF': preds[2]}
 
-        # 6. Render All Visualizations
+        # Render All Visualizations
         st.subheader("🌐 2D Pareto Front (API vs EFRF)")
-        render_pareto_evolution()  # now uses session_state.golden_solution and pareto_history
+        render_pareto_evolution()
         
         st.subheader("🌐 3D Pareto Front (API - EFRF - Tensile)")
-        # Use the last entry from gen_history to get the final Pareto front
         last_entry = gen_history[-1]
         final_pop_hist = last_entry['population']
         final_obj_hist = last_entry['objectives']
-        # Find golden index within this population (by API match)
         golden_idx_hist = None
         if golden:
             for i, row in enumerate(final_pop_hist):
@@ -1473,7 +1474,6 @@ def main():
         render_best_solutions()
         render_optimization_summary()
 
-        # NEW: Sensitivity Analysis (Collapsible)
         with st.expander("🔬 Sensitivity Analysis (Local)", expanded=False):
             model = st.session_state.get('_trained_model')
             scaler = st.session_state.get('_trained_scaler')
@@ -1494,7 +1494,6 @@ def main():
         render_results_summary(st.session_state.results)
         render_pareto_evolution()
         
-        # NEW: 3D Pareto on re-run
         with st.expander("🌐 3D Pareto Front (API - EFRF - Tensile)", expanded=False):
             gen_history = st.session_state.get('pareto_history')
             if gen_history:
@@ -1515,7 +1514,6 @@ def main():
         render_best_solutions()
         render_optimization_summary()
 
-        # NEW: Sensitivity Analysis on re-run
         with st.expander("🔬 Sensitivity Analysis (Local)", expanded=False):
             model = st.session_state.get('_trained_model')
             scaler = st.session_state.get('_trained_scaler')
