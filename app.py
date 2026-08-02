@@ -1499,16 +1499,13 @@ def main():
         pareto_obj = pareto_obj[feasible_mask]
         # ------------------------------------------------------------------------
 
-        # ---- GOLDEN SOLUTION SELECTION (UPDATED FOR BETTER BALANCE) ----
-        # Instead of re-predicting the solution using raw model, we pick 
-        # the solution directly from the validated 'solutions' list.
-        # We use a balanced score incorporating both API and the full Quality Score.
+        # ---- GOLDEN SOLUTION SELECTION (BALANCED SCORE USING QUALITY SCORE) ----
         weights = np.array([w_api, w_quality])
         best_score = -np.inf
         golden = solutions[0] # fallback
         
         for sol in solutions:
-            # IMPROVED: Uses Quality Score instead of just EFRF to ensure a balanced formulation
+            # IMPROVED: Uses the full Quality Score instead of just EFRF
             score = (sol['API (%)'] / 100 * weights[0]) + ((sol['Quality Score'] / 100) * weights[1])
             if score > best_score:
                 best_score = score
@@ -1528,7 +1525,7 @@ def main():
         slider_preds, _ = model.predict_with_uncertainty(torch.tensor(scaler.transform(slider_form), dtype=torch.float32))
         tested_data = {'api': float(st.session_state.api), 'efrf': float(slider_preds[0][2]), 'tensile': float(slider_preds[0][1])}
 
-        # --- Sort the full solutions list by the NEW balanced score ---
+        # --- Sort the full solutions list by the BALANCED score ---
         sorted_solutions = sorted(solutions, key=lambda s: (s['API (%)'] / 100 * weights[0]) + ((s['Quality Score'] / 100) * weights[1]), reverse=True)
         st.session_state.best_solutions = sorted_solutions
         # ------------------------------------------------------------------------
