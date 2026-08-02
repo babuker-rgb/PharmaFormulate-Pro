@@ -1460,13 +1460,12 @@ def main():
             opt_progress.progress(frac, text=f"Running NSGA-II generation {min(gen + 1, total)}/{total}...")
         
         nsga_start = time.time()
-        solutions, golden, gen_history, pareto_pop, pareto_obj = run_real_optimization(progress_callback=_update_opt_progress)
+        solutions, golden_from_optimizer, gen_history, pareto_pop, pareto_obj = run_real_optimization(progress_callback=_update_opt_progress)
         nsga_elapsed = round(time.time() - nsga_start, 1)
         opt_progress.empty()
         
         st.session_state.results = get_current_formulation_results()
-        st.session_state.golden_solution = golden
-        st.session_state.best_solutions = solutions
+        # We will recompute golden based on custom weights, so we don't use golden_from_optimizer
         st.session_state.pareto_history = gen_history
         st.session_state.runtime = round(time.time() - start_time, 1)
         st.session_state.train_time = train_elapsed
@@ -1492,7 +1491,7 @@ def main():
         pareto_obj = pareto_obj[feasible_mask]
         # ------------------------------------------------------------------------
 
-        # Calculate Golden solution ONLY from feasible Pareto front solutions
+        # Calculate Golden solution ONLY from feasible Pareto front solutions using custom weights
         weights = np.array([w_api, w_quality])
         scores = []
         for i in range(len(pareto_pop)):
@@ -1505,7 +1504,38 @@ def main():
         pop_scaled = scaler.transform([best_sol])
         preds, unc = model.predict_with_uncertainty(torch.tensor(pop_scaled, dtype=torch.float32))
         preds, unc = preds[0], unc[0]
-        st.success(f"🏆 Golden Solution Found!\nAPI: {best_sol[0]:.2f}% | EFRF: {preds[2]:.3f} ± {unc[2]:.3f}")
+        
+        # Reconstruct the golden dictionary from the chosen solution
+        api_val = best_sol[0]
+        binder_val = best_sol[1]
+        pvpp_val = best_sol[2]
+        mgst_val = best_sol[3]
+        mcc_val = best_sol[4]
+        moisture_val = best_sol[5]
+        density_val = preds[0]
+        tensile_val = preds[1]
+        efrf_val = preds[2]
+        quality = calculate_quality_score(density_val, tensile_val, efrf_val, api=api_val)
+
+        golden = {
+            'Solution': f'S{golden_idx+1}',
+            'API (%)': api_val,
+            'Binder (%)': binder_val,
+            'PVPP (%)': pvpp_val,
+            'MgSt (%)': mgst_val,
+            'MCC (%)': mcc_val,
+            'Moisture (%)': moisture_val,
+            'Total (%)': api_val + binder_val + pvpp_val + mgst_val + mcc_val + moisture_val,
+            'Density': density_val,
+            'Tensile (MPa)': tensile_val,
+            'EFRF': efrf_val,
+            'Quality Score': quality['overall']
+        }
+
+        # Update session state with the unified golden solution
+        st.session_state.golden_solution = golden
+
+        st.success(f"🏆 Golden Solution Found!\nAPI: {golden['API (%)']:.2f}% | EFRF: {golden['EFRF']:.3f} ± {unc[2]:.3f}")
         st.caption(f"Optimization took {st.session_state.runtime:.2f} seconds.")
 
         # Compute Tested Formulation Data using st.session_state
@@ -1517,7 +1547,12 @@ def main():
 
         # Build Solutions DataFrame for Radar / Exports (from pareto solutions)
         sol_list = []
-        sorted_indices = np.argsort([-scores[i] for i in range(len(pareto_pop))])
+        # Recalculate scores for all feasible solutions for consistent ranking
+        scores_all = []
+        for i in range(len(pareto_pop)):
+            s = (pareto_pop[i,0]/100 * weights[0]) + ((1 - pareto_obj[i].sum()/4) * weights[1])
+            scores_all.append(s)
+        sorted_indices = np.argsort([-scores_all[i] for i in range(len(pareto_pop))])
         for idx in sorted_indices[:10]:
             sol_list.append({
                 'Solution': f'S{idx+1}',
@@ -1528,7 +1563,7 @@ def main():
                 'Quality Score': float(100 - (pareto_obj[idx].sum() * 20))
             })
         sol_df = pd.DataFrame(sol_list)
-        golden_plot = {'API (%)': best_sol[0], 'EFRF': preds[2]}
+        st.session_state.best_solutions = sol_list  # Update best solutions for radar and export
 
         # Render All Visualizations
         st.subheader("🌐 2D Pareto Front (API vs EFRF)")
@@ -1541,15 +1576,14 @@ def main():
         final_obj_hist = last_entry['objectives']
         # Find golden index in this population for 3D plot marker
         golden_idx_hist = None
-        if golden:
-            for i, row in enumerate(final_pop_hist):
-                if abs(row[0] - best_sol[0]) < 0.01:
-                    golden_idx_hist = i
-                    break
+        for i, row in enumerate(final_pop_hist):
+            if abs(row[0] - golden['API (%)']) < 0.01:
+                golden_idx_hist = i
+                break
         render_3d_pareto(final_pop_hist, final_obj_hist, golden_idx_hist, tested_data=tested_data)
 
         render_golden_solution(golden)
-        render_side_by_side_comparison(golden, solutions)
+        render_side_by_side_comparison(golden, st.session_state.best_solutions)
         render_best_solutions()
         render_optimization_summary()
 
