@@ -1085,11 +1085,8 @@ def render_pareto_evolution():
     api_sorted = api_feas[sort_idx]
     efrf_sorted = efrf_feas[sort_idx]
 
-    # ----------------------------------------------------------------
-    # FIXED: Enforce monotonic (cumulative minimum) for correct Pareto curve
-    # ----------------------------------------------------------------
+    # Enforce monotonic (cumulative minimum) for correct Pareto curve
     if len(efrf_sorted) > 0:
-        # FIXED: Changed from maximum to minimum to align with the actual Pareto frontier
         cummin_efrf = np.minimum.accumulate(efrf_sorted)
     else:
         cummin_efrf = efrf_sorted
@@ -1118,29 +1115,32 @@ def render_pareto_evolution():
         hovertemplate='API: %{x:.2f}%<br>EFRF: %{y:.3f}<extra></extra>'
     ))
 
-    # ---- EXTENSION TO LIMIT 0.40 ----
+    # ---- EXTENSION TO LIMIT 0.40 (SLANTED INSTEAD OF VERTICAL) ----
     if len(api_sorted) > 0 and cummin_efrf[-1] < 0.40:
         last_api = api_sorted[-1]
         last_efrf = cummin_efrf[-1]
-        # Draw a dashed line from the last Pareto point to the limit at 0.40
+        target_api = API_MAX  # 98.0
+        target_efrf = 0.40
+        
+        # Draw a slanted line from the last Pareto point to (API_MAX, 0.40)
         fig.add_trace(go.Scatter(
-            x=[last_api, last_api],
-            y=[last_efrf, 0.40],
+            x=[last_api, target_api],
+            y=[last_efrf, target_efrf],
             mode='lines',
             name='Front extension to limit',
             line=dict(color='red', width=2, dash='dash'),
             showlegend=True,
             hovertemplate='Extension to EFRF=0.40<extra></extra>'
         ))
-        # Add a marker at the limit point
+        # Add a red cross marker at the limit point (API_MAX, 0.40)
         fig.add_trace(go.Scatter(
-            x=[last_api],
-            y=[0.40],
+            x=[target_api],
+            y=[target_efrf],
             mode='markers',
             name='EFRF limit point',
             marker=dict(size=8, color='red', symbol='cross'),
             showlegend=True,
-            hovertemplate=f'API: {last_api:.2f}%<br>EFRF: 0.40<extra></extra>'
+            hovertemplate=f'API: {target_api:.2f}%<br>EFRF: 0.40<extra></extra>'
         ))
     # --------------------------------------
 
@@ -1499,17 +1499,17 @@ def main():
         pareto_obj = pareto_obj[feasible_mask]
         # ------------------------------------------------------------------------
 
-        # ---- GOLDEN SOLUTION SELECTION (FIXED TO AVOID FLOATING STAR) ----
-        # Instead of re-predicting the solution using raw model (which creates a mismatch
-        # causing the star to float), we pick the solution directly from the validated 
-        # 'solutions' list (which already contains correct, adjusted Pareto values).
+        # ---- GOLDEN SOLUTION SELECTION (UPDATED FOR BETTER BALANCE) ----
+        # Instead of re-predicting the solution using raw model, we pick 
+        # the solution directly from the validated 'solutions' list.
+        # We use a balanced score incorporating both API and the full Quality Score.
         weights = np.array([w_api, w_quality])
         best_score = -np.inf
         golden = solutions[0] # fallback
         
         for sol in solutions:
-            # Score = normalized API + normalized quality (using 1 - EFRF as proxy for quality)
-            score = (sol['API (%)'] / 100 * weights[0]) + ((1 - sol['EFRF']) * weights[1])
+            # IMPROVED: Uses Quality Score instead of just EFRF to ensure a balanced formulation
+            score = (sol['API (%)'] / 100 * weights[0]) + ((sol['Quality Score'] / 100) * weights[1])
             if score > best_score:
                 best_score = score
                 golden = sol
@@ -1528,10 +1528,8 @@ def main():
         slider_preds, _ = model.predict_with_uncertainty(torch.tensor(scaler.transform(slider_form), dtype=torch.float32))
         tested_data = {'api': float(st.session_state.api), 'efrf': float(slider_preds[0][2]), 'tensile': float(slider_preds[0][1])}
 
-        # --- Sort the full solutions list by weighted score for UI consistency ---
-        # We need to sort the solutions list (which contains all columns) based on the same weights
-        # to ensure the radar chart and top solutions table match the gold selection.
-        sorted_solutions = sorted(solutions, key=lambda s: (s['API (%)'] / 100 * weights[0]) + ((1 - s['EFRF']) * weights[1]), reverse=True)
+        # --- Sort the full solutions list by the NEW balanced score ---
+        sorted_solutions = sorted(solutions, key=lambda s: (s['API (%)'] / 100 * weights[0]) + ((s['Quality Score'] / 100) * weights[1]), reverse=True)
         st.session_state.best_solutions = sorted_solutions
         # ------------------------------------------------------------------------
 
