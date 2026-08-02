@@ -260,6 +260,33 @@ class InputScaler:
     def transform(self, X):
         return (X - self.mean_) / self.std_
 
+def apply_ood_shrinkage(pred, pop_scaled, y_train_mean):
+    """Shrinks density/tensile/EFRF predictions toward the training-target
+    mean, proportional to how far out-of-distribution the (scaled) input
+    is. BUGFIX: this exact correction previously existed only inside
+    NSGAIIOptimizer.evaluate() — the "Quick Predict" / current-formulation
+    path (get_current_formulation_results()) called model.predict()
+    directly with no correction at all. For a formulation sitting in a
+    sparsely-trained region, that produced simultaneous saturation on
+    multiple outputs at once (density crashing to its floor while tensile/
+    EFRF/disintegration all hit their own extremes for the same input) —
+    exactly the surrogate-exploitation failure mode the optimizer's
+    shrinkage was built to prevent, just reachable through a path that
+    never got the fix. Extracted into one shared function so the two
+    prediction paths can't silently drift apart again.
+    Returns (density, tensile, efrf) — matches what NSGAIIOptimizer.evaluate()
+    corrects; disintegration/dissolution are left as raw predictions,
+    consistent with the optimizer's existing (not-yet-extended) scope.
+    """
+    density, tensile, efrf = pred[..., 0], pred[..., 1], pred[..., 2]
+    ood_z = np.abs(pop_scaled)
+    ood_raw = np.clip(ood_z - 2.0, 0, None).sum(axis=-1)
+    shrink_factor = 1.0 / (1.0 + ood_raw)
+    density = shrink_factor * density + (1 - shrink_factor) * y_train_mean[0]
+    tensile = shrink_factor * tensile + (1 - shrink_factor) * y_train_mean[1]
+    efrf = shrink_factor * efrf + (1 - shrink_factor) * y_train_mean[2]
+    return density, tensile, efrf
+
 # ================================================================
 # CHECKPOINT PATHS & ATOMIC SAVE (From v29.28)
 # ================================================================
@@ -449,17 +476,9 @@ class NSGAIIOptimizer:
         pop_scaled = self.scaler.transform(pop)
         with torch.no_grad():
             pred = self.model.predict(pop_scaled)
-        density = pred[:, 0]
-        tensile = pred[:, 1]
-        efrf = pred[:, 2]
         api = pop[:, 0]
-        
-        ood_z = np.abs(pop_scaled)
-        ood_raw = np.clip(ood_z - 2.0, 0, None).sum(axis=1)
-        shrink_factor = 1.0 / (1.0 + ood_raw)
-        density = shrink_factor * density + (1 - shrink_factor) * self.y_train_mean[0]
-        tensile = shrink_factor * tensile + (1 - shrink_factor) * self.y_train_mean[1]
-        efrf = shrink_factor * efrf + (1 - shrink_factor) * self.y_train_mean[2]
+
+        density, tensile, efrf = apply_ood_shrinkage(pred, pop_scaled, self.y_train_mean)
         
         fitness = np.column_stack([-density, -tensile, efrf])
         api_norm = np.clip((api - 80) / 18, 0.0, 1.0)
@@ -706,10 +725,12 @@ def run_real_optimization(progress_callback=None):
 def get_current_formulation_results():
     model = st.session_state.get('_trained_model')
     scaler = st.session_state.get('_trained_scaler')
-    if model is None or scaler is None:
-        model, scaler, _ = get_model_and_scaler()
+    history = st.session_state.get('_trained_history')
+    if model is None or scaler is None or history is None:
+        model, scaler, history = get_model_and_scaler()
         st.session_state['_trained_model'] = model
         st.session_state['_trained_scaler'] = scaler
+        st.session_state['_trained_history'] = history
 
     n = normalize_formulation(
         st.session_state.api, st.session_state.binder, st.session_state.pvpp,
@@ -717,10 +738,19 @@ def get_current_formulation_results():
     )
     row = np.array([[n['api'], n['binder'], n['pvpp'], n['mgst'], n['mcc'], n['moisture'],
                      st.session_state.pressure, st.session_state.speed]], dtype=np.float32)
-    pred = model.predict(scaler.transform(row))[0]
+    row_scaled = scaler.transform(row)
+    pred = model.predict(row_scaled)[0]
+    # BUGFIX: previously used this raw, unshrunk prediction directly — see
+    # apply_ood_shrinkage() for why that let this specific path produce
+    # simultaneously-saturated outputs (density at its floor, tensile/EFRF
+    # at their extremes) for formulations in sparsely-trained regions,
+    # while the NSGA-II optimizer's own predictions were already corrected
+    # for exactly this.
+    y_train_mean = history.get('y_train_mean', [0.75, 4.5, 0.5, 20.0, 45.0])
+    density, tensile, efrf = apply_ood_shrinkage(pred[np.newaxis, :], row_scaled, y_train_mean)
     return {
         'api': float(n['api']),
-        'density': float(pred[0]), 'tensile': float(pred[1]), 'efrf': float(pred[2]),
+        'density': float(density[0]), 'tensile': float(tensile[0]), 'efrf': float(efrf[0]),
         'disintegration': float(pred[3]), 'dissolution': float(pred[4])
     }
 
