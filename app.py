@@ -1496,51 +1496,26 @@ def main():
         pareto_obj = pareto_obj[feasible_mask]
         # ------------------------------------------------------------------------
 
-        # Calculate Golden solution ONLY from feasible Pareto front solutions using custom weights
+        # ---- GOLDEN SOLUTION SELECTION (FIXED TO AVOID FLOATING STAR) ----
+        # Instead of re-predicting the solution using raw model (which creates a mismatch
+        # causing the star to float), we pick the solution directly from the validated 
+        # 'solutions' list (which already contains correct, adjusted Pareto values).
         weights = np.array([w_api, w_quality])
-        scores = []
-        for i in range(len(pareto_pop)):
-            s = (pareto_pop[i,0]/100 * weights[0]) + ((1 - pareto_obj[i].sum()/4) * weights[1])
-            scores.append(s)
-        golden_idx = np.argmax(scores)
-        best_sol = pareto_pop[golden_idx]
+        best_score = -np.inf
+        golden = solutions[0] # fallback
         
-        # Predict uncertainty for the golden solution
-        pop_scaled = scaler.transform([best_sol])
-        preds, unc = model.predict_with_uncertainty(torch.tensor(pop_scaled, dtype=torch.float32))
-        preds, unc = preds[0], unc[0]
+        for sol in solutions:
+            # Score = normalized API + normalized quality (using 1 - EFRF as proxy for quality)
+            score = (sol['API (%)'] / 100 * weights[0]) + ((1 - sol['EFRF']) * weights[1])
+            if score > best_score:
+                best_score = score
+                golden = sol
         
-        # Reconstruct the golden dictionary from the chosen solution
-        api_val = best_sol[0]
-        binder_val = best_sol[1]
-        pvpp_val = best_sol[2]
-        mgst_val = best_sol[3]
-        mcc_val = best_sol[4]
-        moisture_val = best_sol[5]
-        density_val = preds[0]
-        tensile_val = preds[1]
-        efrf_val = preds[2]
-        quality = calculate_quality_score(density_val, tensile_val, efrf_val, api=api_val)
-
-        golden = {
-            'Solution': f'S{golden_idx+1}',
-            'API (%)': api_val,
-            'Binder (%)': binder_val,
-            'PVPP (%)': pvpp_val,
-            'MgSt (%)': mgst_val,
-            'MCC (%)': mcc_val,
-            'Moisture (%)': moisture_val,
-            'Total (%)': api_val + binder_val + pvpp_val + mgst_val + mcc_val + moisture_val,
-            'Density': density_val,
-            'Tensile (MPa)': tensile_val,
-            'EFRF': efrf_val,
-            'Quality Score': quality['overall']
-        }
-
         # Update session state with the unified golden solution
         st.session_state.golden_solution = golden
+        # ------------------------------------------------------------------------
 
-        st.success(f"🏆 Golden Solution Found!\nAPI: {golden['API (%)']:.2f}% | EFRF: {golden['EFRF']:.3f} ± {unc[2]:.3f}")
+        st.success(f"🏆 Golden Solution Found!\nAPI: {golden['API (%)']:.2f}% | EFRF: {golden['EFRF']:.3f}")
         st.caption(f"Optimization took {st.session_state.runtime:.2f} seconds.")
 
         # Compute Tested Formulation Data using st.session_state
@@ -1550,33 +1525,12 @@ def main():
         slider_preds, _ = model.predict_with_uncertainty(torch.tensor(scaler.transform(slider_form), dtype=torch.float32))
         tested_data = {'api': float(st.session_state.api), 'efrf': float(slider_preds[0][2]), 'tensile': float(slider_preds[0][1])}
 
-        # ---- FIX: Use the full solutions list, sorted by weighted scores ----
-        # Compute scores for all feasible solutions using the same weights
-        scores_all = []
-        for i in range(len(pareto_pop)):
-            s = (pareto_pop[i,0]/100 * weights[0]) + ((1 - pareto_obj[i].sum()/4) * weights[1])
-            scores_all.append(s)
-        sorted_indices = np.argsort([-scores_all[i] for i in range(len(pareto_pop))])
-        
-        # Rebuild the full solutions list from the original 'solutions' (which contain all columns)
-        # We need to map the sorted indices to the original solutions list
-        # Since 'solutions' corresponds to pareto_pop (feasible), we can sort it accordingly
-        # But 'solutions' was already filtered to feasible; we'll re-sort it.
-        # We need to get the full solutions list from the optimizer (which is returned as 'solutions')
-        # and we have 'solutions' variable already.
-        # We'll create a list of (score, solution) and sort.
-        # However, 'solutions' is already a list of dicts; we can sort it directly.
-        # To keep it simple, we'll create a sorted list from 'solutions' using the scores computed.
-        # We'll pair each solution with its score from scores_all.
-        paired = list(zip(scores_all, solutions))
-        paired.sort(key=lambda x: -x[0])  # sort descending
-        sorted_solutions = [sol for _, sol in paired]
+        # --- Sort the full solutions list by weighted score for UI consistency ---
+        # We need to sort the solutions list (which contains all columns) based on the same weights
+        # to ensure the radar chart and top solutions table match the gold selection.
+        sorted_solutions = sorted(solutions, key=lambda s: (s['API (%)'] / 100 * weights[0]) + ((1 - s['EFRF']) * weights[1]), reverse=True)
         st.session_state.best_solutions = sorted_solutions
-        # ----------------------------------------------------------------
-
-        # Build a limited DataFrame for radar (if needed) - but we already have full solutions.
-        # We'll keep the radar using the full solutions.
-        # The radar uses only a subset of columns anyway, so it's fine.
+        # ------------------------------------------------------------------------
 
         # Render All Visualizations
         st.subheader("🌐 2D Pareto Front (API vs EFRF)")
