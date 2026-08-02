@@ -1085,12 +1085,15 @@ def render_pareto_evolution():
     api_sorted = api_feas[sort_idx]
     efrf_sorted = efrf_feas[sort_idx]
 
-    # Enforce monotonic (cumulative minimum) for correct Pareto curve
-    if len(efrf_sorted) > 0:
-        cummin_efrf = np.minimum.accumulate(efrf_sorted)
-    else:
-        cummin_efrf = efrf_sorted
-
+    # BUGFIX: this previously plotted `cummin_efrf = np.minimum.accumulate
+    # (efrf_sorted)` instead of the real efrf_sorted values — that doesn't
+    # select or filter points, it OVERWRITES each point's true EFRF with
+    # the running minimum seen so far as API increases. The line drawn
+    # from that was not the actual Pareto front; it was a fabricated
+    # monotonic envelope that happened to look clean. That's also why the
+    # golden star (correctly sourced from the real pareto_obj values)
+    # never lined up with the curve — the curve itself wasn't showing real
+    # data. Plotting the true, unmodified values fixes both at once.
     fig = go.Figure()
 
     fig.add_hrect(
@@ -1104,10 +1107,10 @@ def render_pareto_evolution():
         name='Feasible region (EFRF < 0.40)'
     ))
 
-    # Smooth Pareto front line + markers (using cummin_efrf)
+    # Real Pareto front line + markers (true EFRF values, not smoothed/distorted)
     fig.add_trace(go.Scatter(
         x=api_sorted,
-        y=cummin_efrf,
+        y=efrf_sorted,
         mode='lines+markers',
         name='Pareto Front',
         line=dict(color='red', width=2),
@@ -1115,34 +1118,17 @@ def render_pareto_evolution():
         hovertemplate='API: %{x:.2f}%<br>EFRF: %{y:.3f}<extra></extra>'
     ))
 
-    # ---- EXTENSION TO LIMIT 0.40 (SLANTED INSTEAD OF VERTICAL) ----
-    if len(api_sorted) > 0 and cummin_efrf[-1] < 0.40:
-        last_api = api_sorted[-1]
-        last_efrf = cummin_efrf[-1]
-        target_api = API_MAX  # 98.0
-        target_efrf = 0.40
-        
-        # Draw a slanted line from the last Pareto point to (API_MAX, 0.40)
-        fig.add_trace(go.Scatter(
-            x=[last_api, target_api],
-            y=[last_efrf, target_efrf],
-            mode='lines',
-            name='Front extension to limit',
-            line=dict(color='red', width=2, dash='dash'),
-            showlegend=True,
-            hovertemplate='Extension to EFRF=0.40<extra></extra>'
-        ))
-        # Add a red cross marker at the limit point (API_MAX, 0.40)
-        fig.add_trace(go.Scatter(
-            x=[target_api],
-            y=[target_efrf],
-            mode='markers',
-            name='EFRF limit point',
-            marker=dict(size=8, color='red', symbol='cross'),
-            showlegend=True,
-            hovertemplate=f'API: {target_api:.2f}%<br>EFRF: 0.40<extra></extra>'
-        ))
-    # --------------------------------------
+    # BUGFIX: removed the "Front extension to limit" line and "EFRF limit
+    # point" marker that were here — they hardcoded a fabricated endpoint
+    # at (API_MAX, 0.40) and drew a line to it, regardless of whether any
+    # real solution existed anywhere near there. That's not a visualization
+    # choice, it's presenting an invented data point as if it were part of
+    # the optimizer's actual output. If the true front doesn't reach the
+    # EFRF boundary, that itself is the correct (and informative) thing to
+    # show — solutions closer to the boundary are dominated by ones the
+    # optimizer already found, so a real NSGA-II run correctly excludes
+    # them from the front rather than the front falling short of a target
+    # by mistake.
 
     # Golden solution (already feasible)
     if golden:
