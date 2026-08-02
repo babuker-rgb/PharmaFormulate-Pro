@@ -700,7 +700,6 @@ def run_real_optimization(progress_callback=None):
     pareto_pop = final_pop[pareto_idx]
     pareto_obj = final_obj[pareto_idx]
 
-    # Filter feasible solutions (EFRF < 0.40) for building the list
     preds = model.predict(scaler.transform(pareto_pop))
     solutions = []
     for i, (row, pred) in enumerate(zip(pareto_pop, preds)):
@@ -1235,9 +1234,15 @@ def render_side_by_side_comparison(golden, all_solutions):
     st.markdown("## 📊 Side‑by‑Side Comparison")
     top = all_solutions[:3]
     df = pd.DataFrame(top)
-    st.dataframe(df[['Solution','API (%)','Binder (%)','PVPP (%)','MgSt (%)',
+    # FIX: ensure all expected columns exist; if not, we fill with NaN or skip
+    expected_cols = ['Solution','API (%)','Binder (%)','PVPP (%)','MgSt (%)',
                      'MCC (%)','Moisture (%)','Density','Tensile (MPa)',
-                     'EFRF','Quality Score']], use_container_width=True)
+                     'EFRF','Quality Score']
+    # If any column is missing, add it with NaN
+    for col in expected_cols:
+        if col not in df.columns:
+            df[col] = np.nan
+    st.dataframe(df[expected_cols], use_container_width=True)
     
     st.markdown("### 🎯 Dynamic Performance Radar")
     # allow user to select which solutions to compare
@@ -1545,25 +1550,33 @@ def main():
         slider_preds, _ = model.predict_with_uncertainty(torch.tensor(scaler.transform(slider_form), dtype=torch.float32))
         tested_data = {'api': float(st.session_state.api), 'efrf': float(slider_preds[0][2]), 'tensile': float(slider_preds[0][1])}
 
-        # Build Solutions DataFrame for Radar / Exports (from pareto solutions)
-        sol_list = []
-        # Recalculate scores for all feasible solutions for consistent ranking
+        # ---- FIX: Use the full solutions list, sorted by weighted scores ----
+        # Compute scores for all feasible solutions using the same weights
         scores_all = []
         for i in range(len(pareto_pop)):
             s = (pareto_pop[i,0]/100 * weights[0]) + ((1 - pareto_obj[i].sum()/4) * weights[1])
             scores_all.append(s)
         sorted_indices = np.argsort([-scores_all[i] for i in range(len(pareto_pop))])
-        for idx in sorted_indices[:10]:
-            sol_list.append({
-                'Solution': f'S{idx+1}',
-                'API (%)': float(pareto_pop[idx, 0]),
-                'Density': float(-pareto_obj[idx, 0]),
-                'Tensile (MPa)': float(-pareto_obj[idx, 1]),
-                'EFRF': float(pareto_obj[idx, 2]),
-                'Quality Score': float(100 - (pareto_obj[idx].sum() * 20))
-            })
-        sol_df = pd.DataFrame(sol_list)
-        st.session_state.best_solutions = sol_list  # Update best solutions for radar and export
+        
+        # Rebuild the full solutions list from the original 'solutions' (which contain all columns)
+        # We need to map the sorted indices to the original solutions list
+        # Since 'solutions' corresponds to pareto_pop (feasible), we can sort it accordingly
+        # But 'solutions' was already filtered to feasible; we'll re-sort it.
+        # We need to get the full solutions list from the optimizer (which is returned as 'solutions')
+        # and we have 'solutions' variable already.
+        # We'll create a list of (score, solution) and sort.
+        # However, 'solutions' is already a list of dicts; we can sort it directly.
+        # To keep it simple, we'll create a sorted list from 'solutions' using the scores computed.
+        # We'll pair each solution with its score from scores_all.
+        paired = list(zip(scores_all, solutions))
+        paired.sort(key=lambda x: -x[0])  # sort descending
+        sorted_solutions = [sol for _, sol in paired]
+        st.session_state.best_solutions = sorted_solutions
+        # ----------------------------------------------------------------
+
+        # Build a limited DataFrame for radar (if needed) - but we already have full solutions.
+        # We'll keep the radar using the full solutions.
+        # The radar uses only a subset of columns anyway, so it's fine.
 
         # Render All Visualizations
         st.subheader("🌐 2D Pareto Front (API vs EFRF)")
