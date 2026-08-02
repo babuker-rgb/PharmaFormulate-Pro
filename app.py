@@ -1085,11 +1085,14 @@ def render_pareto_evolution():
     api_sorted = api_feas[sort_idx]
     efrf_sorted = efrf_feas[sort_idx]
 
-    # Enforce monotonic (cumulative maximum) for smooth curve
+    # ----------------------------------------------------------------
+    # FIXED: Enforce monotonic (cumulative minimum) for correct Pareto curve
+    # ----------------------------------------------------------------
     if len(efrf_sorted) > 0:
-        cummax_efrf = np.maximum.accumulate(efrf_sorted)
+        # FIXED: Changed from maximum to minimum to align with the actual Pareto frontier
+        cummin_efrf = np.minimum.accumulate(efrf_sorted)
     else:
-        cummax_efrf = efrf_sorted
+        cummin_efrf = efrf_sorted
 
     fig = go.Figure()
 
@@ -1104,10 +1107,10 @@ def render_pareto_evolution():
         name='Feasible region (EFRF < 0.40)'
     ))
 
-    # Smooth Pareto front line + markers (using cummax_efrf)
+    # Smooth Pareto front line + markers (using cummin_efrf)
     fig.add_trace(go.Scatter(
         x=api_sorted,
-        y=cummax_efrf,
+        y=cummin_efrf,
         mode='lines+markers',
         name='Pareto Front',
         line=dict(color='red', width=2),
@@ -1116,9 +1119,9 @@ def render_pareto_evolution():
     ))
 
     # ---- EXTENSION TO LIMIT 0.40 ----
-    if len(api_sorted) > 0 and cummax_efrf[-1] < 0.40:
+    if len(api_sorted) > 0 and cummin_efrf[-1] < 0.40:
         last_api = api_sorted[-1]
-        last_efrf = cummax_efrf[-1]
+        last_efrf = cummin_efrf[-1]
         # Draw a dashed line from the last Pareto point to the limit at 0.40
         fig.add_trace(go.Scatter(
             x=[last_api, last_api],
