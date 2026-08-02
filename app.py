@@ -73,7 +73,7 @@ def initialize_session_state():
         'granule': 125.0, 'dwell_time': 25.0, 'friction': 0.25,
         'decompression_time': 35.0, 'optimization_complete': False,
         'results': None, 'best_solutions': None, 'golden_solution': None,
-        'runtime': 0, 'pareto_history': None,
+        'runtime': 0, 'train_time': None, 'nsga_time': None, 'pareto_history': None,
         'user_data': None, 'data_source': 'synthetic',
         'force_retrain': False,
         '_trained_model': None, '_trained_scaler': None, '_trained_history': None
@@ -1333,10 +1333,23 @@ def render_optimization_summary():
     st.markdown("## 📈 Optimization Summary")
     col1, col2 = st.columns(2)
     with col1:
-        st.metric("⏱️ Runtime", f"{st.session_state.runtime}s" if st.session_state.runtime else "—")
+        st.metric("⏱️ Total Runtime", f"{st.session_state.runtime}s" if st.session_state.runtime else "—")
+        train_t = st.session_state.get('train_time')
+        nsga_t = st.session_state.get('nsga_time')
+        if train_t is not None and nsga_t is not None:
+            # NEW: "Runtime" previously bundled model load/train time and
+            # the NSGA-II optimization time into one number, with no way to
+            # tell which phase was actually slow when the total was
+            # unexpectedly high (as it was on this run). Broken out here.
+            st.caption(f"Model load/train: {train_t}s · NSGA-II search: {nsga_t}s")
     with col2:
-        evals_per_sec = (POPULATION_SIZE * NSGA_GENERATIONS) / max(1, st.session_state.runtime)
-        st.metric("⚡ Evaluations/Second", f"{evals_per_sec:.0f}")
+        # BUGFIX: this was previously computed from the TOTAL runtime
+        # (including training), which understates true optimization
+        # throughput whenever training time is non-trivial — "evaluations
+        # per second" should reflect the NSGA-II loop alone.
+        nsga_time_for_calc = st.session_state.get('nsga_time') or st.session_state.runtime
+        evals_per_sec = (POPULATION_SIZE * NSGA_GENERATIONS) / max(1, nsga_time_for_calc)
+        st.metric("⚡ Evaluations/Second (NSGA-II only)", f"{evals_per_sec:.0f}")
 
     solutions = st.session_state.get('best_solutions') or []
     col3, col4 = st.columns([2, 1])
@@ -1430,13 +1443,25 @@ def main():
             return
         st.session_state.optimization_complete = True
 
+        # NEW: previously start_time covered render_training_progress()
+        # (model load/train) AND the NSGA-II run combined into one
+        # "Runtime" / "Evaluations per second" figure — which is
+        # misleading (evaluations/second implies pure optimization
+        # throughput) and made two consecutive ~50s runs impossible to
+        # diagnose, since there was no way to tell whether training or
+        # optimization was the slow part. Split so the next run shows both.
+        train_start = time.time()
         render_training_progress()
+        train_elapsed = round(time.time() - train_start, 1)
+
         opt_progress = st.progress(0, text="Running NSGA-II generation 0/%d..." % NSGA_GENERATIONS)
         def _update_opt_progress(gen, total):
             frac = min(1.0, max(0.0, (gen + 1) / total))
             opt_progress.progress(frac, text=f"Running NSGA-II generation {min(gen + 1, total)}/{total}...")
         
+        nsga_start = time.time()
         solutions, golden, gen_history, pareto_pop, pareto_obj = run_real_optimization(progress_callback=_update_opt_progress)
+        nsga_elapsed = round(time.time() - nsga_start, 1)
         opt_progress.empty()
         
         st.session_state.results = get_current_formulation_results()
@@ -1444,6 +1469,8 @@ def main():
         st.session_state.best_solutions = solutions
         st.session_state.pareto_history = gen_history
         st.session_state.runtime = round(time.time() - start_time, 1)
+        st.session_state.train_time = train_elapsed
+        st.session_state.nsga_time = nsga_elapsed
 
         # Store weights safely for future use
         st.session_state.sidebar_w_api = w_api
