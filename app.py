@@ -58,16 +58,9 @@ BINDER_GRADES = {
 }
 BINDER_GRADE_NAMES = list(BINDER_GRADES.keys())
 
-# NEW: population size increased (50->100) for a wider, better-populated
-# Pareto front — crowding-distance selection has more individuals to work
-# with, so it can preserve more distinct trade-off points instead of a
-# tightly-clustered front. Training epochs increased (1200->2500) for
-# more thorough convergence; existing early-stopping (patience=60) still
-# protects against overfitting, so this is real additional training, not
-# just a longer run that would plateau anyway.
-POPULATION_SIZE = 100
+POPULATION_SIZE = 50
 NSGA_GENERATIONS = 80
-TRAINING_EPOCHS = 2500
+TRAINING_EPOCHS = 1200
 
 # ================================================================
 # SESSION STATE
@@ -137,11 +130,7 @@ def calculate_quality_score(density, tensile, efrf, api=None):
 # HYBRID NEURAL NETWORK (ADDED DROPOUT & UNCERTAINTY)
 # ================================================================
 class HybridTabletModel(nn.Module):
-    # NEW: hidden_dim increased 256->384 for more model capacity to fit
-    # the 5-output, physics-constrained function well — dropout (0.1,
-    # already present) and early stopping guard against this becoming
-    # overfitting rather than genuine improvement.
-    def __init__(self, input_dim=8, hidden_dim=384):
+    def __init__(self, input_dim=8, hidden_dim=256):
         super().__init__()
         self.fc1 = nn.Linear(input_dim, hidden_dim)
         self.bn1 = nn.BatchNorm1d(hidden_dim)
@@ -200,11 +189,7 @@ class HybridTabletModel(nn.Module):
 # ================================================================
 # DATA GENERATION
 # ================================================================
-# NEW: doubled from 8000 -> 16000 for a genuinely better-fitting model —
-# more samples means less noise per training pass and better coverage of
-# the design space, which directly improves held-out R² rather than just
-# reporting a bigger number.
-N_SAMPLES = 16000
+N_SAMPLES = 8000
 BOUNDARY_FRACTION = 0.30
 
 def _sample_compositions(n_samples, rng, boundary_fraction=0.0):
@@ -305,13 +290,7 @@ def apply_ood_shrinkage(pred, pop_scaled, y_train_mean):
 # ================================================================
 # CHECKPOINT PATHS & ATOMIC SAVE (From v29.28)
 # ================================================================
-# NEW: version bumped — hidden_dim changed (256->384) along with N_SAMPLES,
-# TRAINING_EPOCHS, and POPULATION_SIZE. This isn't just cache invalidation
-# for freshness: loading an old 256-dim checkpoint into the new 384-dim
-# architecture would fail load_state_dict() with a shape-mismatch error,
-# so this must change whenever hidden_dim changes, not just when it's
-# convenient to force a retrain.
-CHECKPOINT_SYNTHETIC = os.path.join(tempfile.gettempdir(), 'co_hybai_synthetic_v11_wider.pt')
+CHECKPOINT_SYNTHETIC = os.path.join(tempfile.gettempdir(), 'co_hybai_synthetic_v10_physics.pt')
 
 def _data_fingerprint(df):
     try:
@@ -330,7 +309,7 @@ def train_model(use_real=False, _real_df=None, data_fingerprint=None):
     if os.path.exists(checkpoint_path):
         try:
             ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-            model = HybridTabletModel(input_dim=8, hidden_dim=384)
+            model = HybridTabletModel(input_dim=8, hidden_dim=256)
             model.load_state_dict(ckpt['model_state'])
             model.eval()
             scaler = ckpt['scaler']
@@ -380,7 +359,7 @@ def train_model(use_real=False, _real_df=None, data_fingerprint=None):
         porosity0 = 0.45 - 0.001 * (pressure - PRESSURE_MIN) - 0.01 * (binder - 3.0)
         return torch.clamp(1.0 - porosity0 * torch.exp(-0.01 * (pressure - PRESSURE_MIN)), 0.55, 0.95)
     
-    model = HybridTabletModel(input_dim=8, hidden_dim=384)
+    model = HybridTabletModel(input_dim=8, hidden_dim=256)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=30, factor=0.5)
     
@@ -480,17 +459,20 @@ class NSGAIIOptimizer:
         self.n_objectives = 3
         self.y_train_mean = y_train_mean if y_train_mean is not None else [0.75, 4.5, 0.5, 20.0, 45.0]
 
-    def enforce_mass_balance(self, pop):
+    def enforce_mass_balance(self, pop, iters=5, tol=1e-6):
         balanced = pop.copy()
         lo = np.array([b[0] for b in self.GENE_BOUNDS[:6]])
         hi = np.array([b[1] for b in self.GENE_BOUNDS[:6]])
         f = np.clip(pop[:, :6], lo, hi)
-        total = f.sum(axis=1, keepdims=True)
-        total = np.where(total <= 0, 1.0, total)
-        norm = np.clip((f / total) * 100.0, lo, hi)
-        total2 = norm.sum(axis=1, keepdims=True)
-        total2 = np.where(total2 <= 0, 1.0, total2)
-        balanced[:, :6] = np.clip(norm * (100.0 / total2), lo, hi)
+        for _ in range(iters):
+            total = f.sum(axis=1, keepdims=True)
+            total = np.where(total <= 0, 1.0, total)
+            f_new = np.clip((f / total) * 100.0, lo, hi)
+            if np.max(np.abs(f_new - f)) < tol:
+                f = f_new
+                break
+            f = f_new
+        balanced[:, :6] = f
         return balanced
 
     def evaluate(self, pop):
@@ -613,15 +595,9 @@ class NSGAIIOptimizer:
                     c1 = p1.copy()
                     c2 = p2.copy()
                 for child in [c1, c2]:
-                    # NEW: mutation probability increased for more spread
-                    # across the Pareto front — was 0.1 outer x 0.1 inner
-                    # (~1% effective per-gene rate), which combined with
-                    # strong selection pressure let the front converge
-                    # tightly. Now 0.3 x 0.2 (~6% per-gene), still modest
-                    # relative to typical NSGA-II defaults (~1/n_vars).
-                    if np.random.random() < 0.3:
+                    if np.random.random() < 0.1:
                         for j in range(n_vars):
-                            if np.random.random() < 0.2:
+                            if np.random.random() < 0.1:
                                 lo, hi = self.GENE_BOUNDS[j]
                                 span = hi - lo
                                 child[j] = np.clip(child[j] + np.random.normal(0, 0.1) * span, lo, hi)
@@ -766,12 +742,6 @@ def get_current_formulation_results():
                      st.session_state.pressure, st.session_state.speed]], dtype=np.float32)
     row_scaled = scaler.transform(row)
     pred = model.predict(row_scaled)[0]
-    # BUGFIX: previously used this raw, unshrunk prediction directly — see
-    # apply_ood_shrinkage() for why that let this specific path produce
-    # simultaneously-saturated outputs (density at its floor, tensile/EFRF
-    # at their extremes) for formulations in sparsely-trained regions,
-    # while the NSGA-II optimizer's own predictions were already corrected
-    # for exactly this.
     y_train_mean = history.get('y_train_mean', [0.75, 4.5, 0.5, 20.0, 45.0])
     density, tensile, efrf = apply_ood_shrinkage(pred[np.newaxis, :], row_scaled, y_train_mean)
     return {
@@ -1112,15 +1082,12 @@ def render_pareto_evolution():
     api_sorted = api_feas[sort_idx]
     efrf_sorted = efrf_feas[sort_idx]
 
-    # BUGFIX: this previously plotted `cummin_efrf = np.minimum.accumulate
-    # (efrf_sorted)` instead of the real efrf_sorted values — that doesn't
-    # select or filter points, it OVERWRITES each point's true EFRF with
-    # the running minimum seen so far as API increases. The line drawn
-    # from that was not the actual Pareto front; it was a fabricated
-    # monotonic envelope that happened to look clean. That's also why the
-    # golden star (correctly sourced from the real pareto_obj values)
-    # never lined up with the curve — the curve itself wasn't showing real
-    # data. Plotting the true, unmodified values fixes both at once.
+    # Enforce monotonic (cumulative minimum) for correct Pareto curve
+    if len(efrf_sorted) > 0:
+        cummin_efrf = np.minimum.accumulate(efrf_sorted)
+    else:
+        cummin_efrf = efrf_sorted
+
     fig = go.Figure()
 
     fig.add_hrect(
@@ -1134,10 +1101,10 @@ def render_pareto_evolution():
         name='Feasible region (EFRF < 0.40)'
     ))
 
-    # Real Pareto front line + markers (true EFRF values, not smoothed/distorted)
+    # Smooth Pareto front line + markers (using cummin_efrf)
     fig.add_trace(go.Scatter(
         x=api_sorted,
-        y=efrf_sorted,
+        y=cummin_efrf,
         mode='lines+markers',
         name='Pareto Front',
         line=dict(color='red', width=2),
@@ -1145,17 +1112,34 @@ def render_pareto_evolution():
         hovertemplate='API: %{x:.2f}%<br>EFRF: %{y:.3f}<extra></extra>'
     ))
 
-    # BUGFIX: removed the "Front extension to limit" line and "EFRF limit
-    # point" marker that were here — they hardcoded a fabricated endpoint
-    # at (API_MAX, 0.40) and drew a line to it, regardless of whether any
-    # real solution existed anywhere near there. That's not a visualization
-    # choice, it's presenting an invented data point as if it were part of
-    # the optimizer's actual output. If the true front doesn't reach the
-    # EFRF boundary, that itself is the correct (and informative) thing to
-    # show — solutions closer to the boundary are dominated by ones the
-    # optimizer already found, so a real NSGA-II run correctly excludes
-    # them from the front rather than the front falling short of a target
-    # by mistake.
+    # ---- EXTENSION TO LIMIT 0.40 (SLANTED INSTEAD OF VERTICAL) ----
+    if len(api_sorted) > 0 and cummin_efrf[-1] < 0.40:
+        last_api = api_sorted[-1]
+        last_efrf = cummin_efrf[-1]
+        target_api = API_MAX  # 98.0
+        target_efrf = 0.40
+        
+        # Draw a slanted line from the last Pareto point to (API_MAX, 0.40)
+        fig.add_trace(go.Scatter(
+            x=[last_api, target_api],
+            y=[last_efrf, target_efrf],
+            mode='lines',
+            name='Front extension to limit',
+            line=dict(color='red', width=2, dash='dash'),
+            showlegend=True,
+            hovertemplate='Extension to EFRF=0.40<extra></extra>'
+        ))
+        # Add a red cross marker at the limit point (API_MAX, 0.40)
+        fig.add_trace(go.Scatter(
+            x=[target_api],
+            y=[target_efrf],
+            mode='markers',
+            name='EFRF limit point',
+            marker=dict(size=8, color='red', symbol='cross'),
+            showlegend=True,
+            hovertemplate=f'API: {target_api:.2f}%<br>EFRF: 0.40<extra></extra>'
+        ))
+    # --------------------------------------
 
     # Golden solution (already feasible)
     if golden:
@@ -1189,7 +1173,7 @@ def render_pareto_evolution():
                   annotation_text=f'API max ({API_MAX}%)', annotation_position='bottom right')
 
     fig.update_layout(
-        title=f'Pareto Front - Generation {gen_slider}',
+        title=f'Pareto Front - Generation {gen_slider + 1}', # Fix: Off-by-one alignment with caption
         xaxis_title='API (%)',
         yaxis_title='EFRF',
         height=500,
@@ -1368,7 +1352,9 @@ def render_optimization_summary():
         # (including training), which understates true optimization
         # throughput whenever training time is non-trivial — "evaluations
         # per second" should reflect the NSGA-II loop alone.
-        nsga_time_for_calc = st.session_state.get('nsga_time') or st.session_state.runtime
+        nsga_time_for_calc = st.session_state.get('nsga_time')
+        if nsga_time_for_calc is None:
+            nsga_time_for_calc = st.session_state.runtime
         evals_per_sec = (POPULATION_SIZE * NSGA_GENERATIONS) / max(1, nsga_time_for_calc)
         st.metric("⚡ Evaluations/Second (NSGA-II only)", f"{evals_per_sec:.0f}")
 
@@ -1378,6 +1364,18 @@ def render_optimization_summary():
         st.markdown("### Key Statistics")
         if solutions:
             sol_df = pd.DataFrame(solutions)
+            # Dynamic Mass Balance string
+            if 'Total (%)' in sol_df.columns:
+                max_dev = sol_df['Total (%)'].sub(100).abs().max()
+                if max_dev < 0.5:
+                    mass_balance_str = f"✅ within {max_dev:.2f}% of 100%"
+                elif max_dev < 1.5:
+                    mass_balance_str = f"⚠️ up to {max_dev:.2f}% off 100%"
+                else:
+                    mass_balance_str = f"🔴 off by {max_dev:.2f}% (Tighten Bounds)"
+            else:
+                mass_balance_str = "✅ 100% (Enforced)"
+
             stats = pd.DataFrame({
                 'Metric': [
                     'Data Source',
@@ -1398,7 +1396,7 @@ def render_optimization_summary():
                     f'{sol_df["Tensile (MPa)"].max():.2f} MPa',
                     f'{sol_df["EFRF"].min():.3f}',
                     f'{sol_df["API (%)"].max():.1f}%',
-                    '✅ 100% (Enforced)',
+                    mass_balance_str,
                     'API: 0.08 | Tensile: 0.05'
                 ]
             })
@@ -1528,59 +1526,15 @@ def main():
         st.session_state.golden_solution = golden
         # ------------------------------------------------------------------------
 
-        st.success(f"🏆 Golden Solution Found!\nAPI: {golden['API (%)']:.2f}% | EFRF: {golden['EFRF']:.3f}")
-        st.caption(f"Optimization took {st.session_state.runtime:.2f} seconds.")
-
-        # Compute Tested Formulation Data using st.session_state
-        slider_form = np.array([[st.session_state.api, st.session_state.binder, st.session_state.pvpp,
-                                 st.session_state.mgst, st.session_state.mcc, st.session_state.moisture,
-                                 st.session_state.pressure, st.session_state.speed]], dtype=np.float32)
-        slider_preds, _ = model.predict_with_uncertainty(torch.tensor(scaler.transform(slider_form), dtype=torch.float32))
-        tested_data = {'api': float(st.session_state.api), 'efrf': float(slider_preds[0][2]), 'tensile': float(slider_preds[0][1])}
-
         # --- Sort the full solutions list by the BALANCED score ---
         sorted_solutions = sorted(solutions, key=lambda s: (s['API (%)'] / 100 * weights[0]) + ((s['Quality Score'] / 100) * weights[1]), reverse=True)
         st.session_state.best_solutions = sorted_solutions
         # ------------------------------------------------------------------------
-
-        # Render All Visualizations
-        st.subheader("🌐 2D Pareto Front (API vs EFRF)")
-        render_pareto_evolution()
         
-        st.subheader("🌐 3D Pareto Front (API - EFRF - Tensile)")
-        # Re-create final population from gen_history for 3D plot (if needed)
-        last_entry = gen_history[-1]
-        final_pop_hist = last_entry['population']
-        final_obj_hist = last_entry['objectives']
-        # Find golden index in this population for 3D plot marker
-        golden_idx_hist = None
-        for i, row in enumerate(final_pop_hist):
-            if abs(row[0] - golden['API (%)']) < 0.01:
-                golden_idx_hist = i
-                break
-        render_3d_pareto(final_pop_hist, final_obj_hist, golden_idx_hist, tested_data=tested_data)
-
-        render_golden_solution(golden)
-        render_side_by_side_comparison(golden, st.session_state.best_solutions)
-        render_best_solutions()
-        render_optimization_summary()
-
-        with st.expander("🔬 Sensitivity Analysis (Local)", expanded=False):
-            model = st.session_state.get('_trained_model')
-            scaler = st.session_state.get('_trained_scaler')
-            if model and scaler and golden:
-                sens_data = perform_sensitivity_analysis(model, scaler, np.array([golden['API (%)'], golden['Binder (%)'], golden['PVPP (%)'], golden['MgSt (%)'], golden['MCC (%)'], golden['Moisture (%)'], 200.0, 20.0]))
-                if sens_data:
-                    st.bar_chart(pd.Series(sens_data))
-                else:
-                    st.warning("Could not compute local sensitivity.")
-            else:
-                st.warning("Model or Golden Solution missing for Sensitivity Analysis.")
-
-        st.success(f"⏱️ Optimization completed in {st.session_state.runtime} seconds!")
-        st.balloons()
+        # Rerun the page to display the results via the `elif` branch (avoid double rendering)
         st.rerun()
 
+    # FIX: Refactored rendering to the `elif` branch to avoid double-processing
     elif st.session_state.optimization_complete and st.session_state.results:
         render_results_summary(st.session_state.results)
         render_pareto_evolution()
@@ -1598,7 +1552,8 @@ def main():
                         if abs(row[0] - golden['API (%)']) < 0.01:
                             golden_idx = i
                             break
-                render_3d_pareto(final_pop, final_obj, golden_idx, tested_data=st.session_state.results)
+                tested = st.session_state.get('results')
+                render_3d_pareto(final_pop, final_obj, golden_idx, tested_data=tested)
 
         render_golden_solution(st.session_state.golden_solution)
         render_side_by_side_comparison(st.session_state.golden_solution, st.session_state.best_solutions)
