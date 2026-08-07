@@ -1,6 +1,24 @@
 # ================================================================
-# Hybrid AI · Multi-Objective Tablet Optimization (Integrated v32.2)
+# Hybrid AI · Multi-Objective Tablet Optimization (Integrated v32.3)
 # Nile Valley University · Sudan · v29.28‑R32 (Heckel PINN + v32.1 Features)
+#
+# v32.3 CHANGES (UI/UX pass):
+#   - Custom CSS theme: cohesive gradient header, styled metric cards,
+#     color-coded status badges (green/amber/red) instead of emoji baked
+#     into st.metric deltas (which Streamlit doesn't reliably color).
+#   - Main layout split into two tabs ("Formulate" / "Optimize & Results")
+#     instead of one long vertical scroll covering inputs, buttons, and
+#     every result section stacked on top of each other.
+#   - Mass balance visual changed from six separate horizontal bars to a
+#     single 100%-stacked composition bar, plus an always-visible live
+#     pass/warn/fail banner that updates as sliders move (no button click
+#     needed to see whether the current mix is usable).
+#   - Golden Solution API/Quality weight sliders moved out of a bolted-on
+#     "return weights to main scope" hack at the bottom of the sidebar
+#     into a proper "Golden Solution Preference" expander with a live
+#     normalized split readout.
+#   - Added pharma-context help tooltips to the formulation and process
+#     sliders (what each parameter does and why it matters).
 #
 # v32.2 CHANGES (review fixes):
 #   1. enforce_mass_balance() now iterates the normalize/clip pair until
@@ -44,11 +62,81 @@ warnings.filterwarnings('ignore')
 # PAGE CONFIG
 # ================================================================
 st.set_page_config(
-    page_title="Hybrid AI · Tablet Optimization v32.2",
+    page_title="Hybrid AI · Tablet Optimization v32.3",
     page_icon="🧬",
     layout="wide",
     initial_sidebar_state="expanded"
 )
+# ================================================================
+# THEME / UI POLISH (v32.3)
+# ================================================================
+def inject_custom_css():
+    """One-time CSS injection for a cohesive visual identity: a
+    consistent color/badge language, card styling for metrics, and a
+    tighter sidebar — instead of relying on Streamlit's plain defaults
+    everywhere. Pure presentation; no logic changes."""
+    st.markdown("""
+    <style>
+    :root {
+        --brand-1: #667eea;
+        --brand-2: #764ba2;
+        --good: #2f9e44;
+        --good-bg: #ebfbee;
+        --warn: #e8590c;
+        --warn-bg: #fff4e6;
+        --bad: #e03131;
+        --bad-bg: #fff5f5;
+    }
+    .block-container { padding-top: 1.5rem; max-width: 1300px; }
+    h1, h2, h3 { letter-spacing: -0.01em; }
+    div[data-testid="stMetric"] {
+        background: #ffffff;
+        border: 1px solid #eceef2;
+        border-radius: 10px;
+        padding: 12px 14px 8px 14px;
+        box-shadow: 0 1px 3px rgba(20,20,43,0.04);
+    }
+    div[data-testid="stMetricLabel"] { font-size: 0.82rem; opacity: 0.75; }
+    .status-badge {
+        display: inline-block; padding: 2px 10px; border-radius: 999px;
+        font-size: 0.78rem; font-weight: 600; margin-top: 4px;
+    }
+    .badge-good { color: var(--good); background: var(--good-bg); }
+    .badge-warn { color: var(--warn); background: var(--warn-bg); }
+    .badge-bad  { color: var(--bad);  background: var(--bad-bg); }
+    .app-header {
+        background: linear-gradient(135deg, var(--brand-1) 0%, var(--brand-2) 100%);
+        padding: 22px 28px; border-radius: 14px; color: white;
+        box-shadow: 0 6px 18px rgba(102,126,234,0.25); margin-bottom: 4px;
+    }
+    .app-header h1 { color: white; margin: 0; font-size: 1.6rem; }
+    .app-header p { color: rgba(255,255,255,0.88); margin: 4px 0 0 0; font-size: 0.92rem; }
+    .live-check {
+        border-radius: 10px; padding: 10px 14px; font-size: 0.88rem;
+        border: 1px solid transparent;
+    }
+    .live-check.ok   { background: var(--good-bg); color: var(--good); border-color: #d3f9d8; }
+    .live-check.warn { background: var(--warn-bg); color: var(--warn); border-color: #ffe8cc; }
+    .live-check.bad  { background: var(--bad-bg);  color: var(--bad);  border-color: #ffc9c9; }
+    section[data-testid="stSidebar"] .stButton button { border-radius: 8px; }
+    div[data-testid="stTabs"] button[role="tab"] { font-weight: 600; }
+    </style>
+    """, unsafe_allow_html=True)
+
+def render_header():
+    st.markdown("""
+    <div class="app-header">
+        <h1>🧬 Hybrid AI · Multi-Objective Tablet Optimization</h1>
+        <p>Nile Valley University · Sudan · Pharmaceutical Engineering · v32.3-Integrated</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+def status_badge_html(level, text):
+    """level: 'good' | 'warn' | 'bad' -> a small colored pill, used
+    wherever we need consistent pass/near-limit/fail coloring instead of
+    emoji-in-delta text (which Streamlit doesn't color reliably)."""
+    cls = {'good': 'badge-good', 'warn': 'badge-warn', 'bad': 'badge-bad'}.get(level, 'badge-warn')
+    return f'<span class="status-badge {cls}">{text}</span>'
 # ================================================================
 # CONSTANTS
 # ================================================================
@@ -741,7 +829,7 @@ def render_sidebar():
     with st.sidebar:
         st.markdown("## 🧬 Hybrid AI Framework")
         st.markdown("---")
-        st.markdown(f"**Version:** v32.2-Integrated")
+        st.markdown(f"**Version:** v32.3-Integrated")
         st.markdown(f"**Institution:** Nile Valley University")
         st.markdown(f"**Department:** Pharmaceutical Engineering")
         st.markdown("---")
@@ -808,6 +896,22 @@ def render_sidebar():
             st.markdown("2. **Maximize Tensile** (penalised low‑tensile)")
             st.markdown("3. **Maximize Density** → Better tablet quality")
             st.markdown("4. **Minimize EFRF** → Better powder flow")
+        with st.expander("🏆 Golden Solution Preference", expanded=True):
+            st.caption("How to weigh the Pareto-optimal solutions when picking one "
+                       "'Golden Solution' — higher API weight favors potency, higher "
+                       "Quality weight favors overall tablet performance.")
+            w_api = st.slider("Weight for API", 0.0, 1.0, 0.4, key="w_api_slider")
+            w_quality = st.slider("Weight for Quality", 0.0, 1.0, 0.6, key="w_quality_slider")
+            w_sum = w_api + w_quality
+            if w_sum > 0:
+                api_pct = round(100 * w_api / w_sum)
+                st.markdown(
+                    f'<div class="live-check ok">⚖️ Effective split: '
+                    f'<b>{api_pct}% API</b> / <b>{100 - api_pct}% Quality</b></div>',
+                    unsafe_allow_html=True)
+            else:
+                st.markdown('<div class="live-check warn">⚠️ Both weights are 0 — the first '
+                             'Pareto solution will be used as a fallback.</div>', unsafe_allow_html=True)
         with st.expander("⚙️ Algorithm Settings", expanded=False):
             st.markdown(f"**Population:** {POPULATION_SIZE}")
             st.markdown(f"**Generations:** {NSGA_GENERATIONS}")
@@ -833,9 +937,6 @@ def render_sidebar():
                 st.rerun()
         st.markdown("---")
         st.caption("© 2024 Nile Valley University · Sudan")
-    # Return weights to main scope
-    w_api = st.sidebar.slider("Weight for API", 0.0, 1.0, 0.4)
-    w_quality = st.sidebar.slider("Weight for Quality", 0.0, 1.0, 0.6)
     return w_api, w_quality
 def render_binder_grade_comparison():
     st.markdown("---")
@@ -875,47 +976,65 @@ def render_mass_balance_display(api, binder, pvpp, mgst, mcc, moisture):
         ('MCC', summary['MCC'], '#ffeaa7'),
         ('Moisture', summary['Moisture'], '#dfe6e9')
     ]
+    # Single 100%-stacked bar (one row, six segments) reads as an
+    # ingredient-breakdown at a glance; six separate horizontal bars
+    # (the previous layout) made every component look like its own
+    # independent measurement rather than parts of one whole.
     fig = go.Figure()
     for name, value, color in components:
         fig.add_trace(go.Bar(
-            y=[name], x=[value], orientation='h',
+            y=['Formulation'], x=[value], orientation='h',
             name=name, marker_color=color,
-            text=f'{value:.1f}%', textposition='outside'
+            text=f'{name}<br>{value:.1f}%' if value >= 6 else '',
+            textposition='inside', insidetextanchor='middle',
+            textfont=dict(size=11, color='#212529'),
+            hovertemplate=f'{name}: {value:.1f}%<extra></extra>'
         ))
     fig.update_layout(
-        xaxis=dict(title='Percentage (%)', range=[0, 105]),
-        height=250, showlegend=False, barmode='stack',
-        margin=dict(l=0, r=0, t=40, b=0),
+        barmode='stack',
+        xaxis=dict(title='Percentage (%)', range=[0, 100.5], showgrid=False),
+        yaxis=dict(visible=False),
+        height=130, showlegend=True,
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='left', x=0, font=dict(size=11)),
+        margin=dict(l=0, r=0, t=30, b=30),
         plot_bgcolor='rgba(0,0,0,0)',
         paper_bgcolor='rgba(0,0,0,0)'
     )
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        st.plotly_chart(fig, use_container_width=True)
-    with col2:
-        deviation = abs(raw_total - 100.0)
-        if deviation < 2.0:
-            status = "✅ Close to 100%"
-        elif deviation < 10.0:
-            status = "⚠️ Adjusted to fit"
-        else:
-            status = "🔴 Large adjustment"
-        st.metric("**Raw Total (before normalization)**", f"{raw_total:.1f}%", status)
-        st.caption("Normalized formulation used for prediction:")
-        for name in ['API', 'Binder', 'PVPP', 'MgSt', 'MCC', 'Moisture']:
-            st.caption(f"{name}: {summary[name]:.1f}%")
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Live pass/fail feedback the moment sliders move — no button click
+    # needed to find out whether the current mix is usable.
+    deviation = abs(raw_total - 100.0)
+    if deviation < 2.0:
+        css_cls, icon, msg = 'ok', '✅', f'Raw total {raw_total:.1f}% — close to 100%, minimal normalization applied.'
+    elif deviation < 10.0:
+        css_cls, icon, msg = 'warn', '⚠️', f'Raw total {raw_total:.1f}% — will be rescaled to fit 100%.'
+    else:
+        css_cls, icon, msg = 'bad', '🔴', f'Raw total {raw_total:.1f}% — large adjustment needed; consider revising the sliders.'
+    st.markdown(f'<div class="live-check {css_cls}">{icon} {msg}</div>', unsafe_allow_html=True)
+
+    with st.expander("Normalized values used for prediction", expanded=False):
+        cols = st.columns(6)
+        for col, name in zip(cols, ['API', 'Binder', 'PVPP', 'MgSt', 'MCC', 'Moisture']):
+            col.metric(name, f"{summary[name]:.1f}%")
 def render_input_panel():
     st.markdown("## 🧪 Formulation Parameters")
     st.info("⚠️ Components will be automatically normalized to sum to 100%.")
     col1, col2 = st.columns(2)
     with col1:
-        st.session_state.api = st.slider("**API Content (%)**", API_MIN, API_MAX, st.session_state.api, step=0.5)
-        st.session_state.binder = st.slider("**Binder (%)**", BINDER_MIN, BINDER_MAX, st.session_state.binder, step=0.1)
-        st.session_state.pvpp = st.slider("**PVPP (%)**", PVPP_MIN, PVPP_MAX, st.session_state.pvpp, step=0.1)
-        st.session_state.mgst = st.slider("**MgSt (%)**", MGST_MIN, MGST_MAX, st.session_state.mgst, step=0.05)
+        st.session_state.api = st.slider("**API Content (%)**", API_MIN, API_MAX, st.session_state.api, step=0.5,
+            help="Active Pharmaceutical Ingredient — the therapeutic payload. Higher API% means less room for excipients, which can hurt compressibility and flow.")
+        st.session_state.binder = st.slider("**Binder (%)**", BINDER_MIN, BINDER_MAX, st.session_state.binder, step=0.1,
+            help="Holds particles together under compression. More binder generally raises tensile strength but can slow disintegration.")
+        st.session_state.pvpp = st.slider("**PVPP (%)**", PVPP_MIN, PVPP_MAX, st.session_state.pvpp, step=0.1,
+            help="Crospovidone (super-disintegrant) — wicks water into the tablet and drives fast breakup / dissolution.")
+        st.session_state.mgst = st.slider("**MgSt (%)**", MGST_MIN, MGST_MAX, st.session_state.mgst, step=0.05,
+            help="Magnesium stearate — lubricant that reduces die-wall friction. Too much coats particles and weakens tensile strength / slows dissolution.")
     with col2:
-        st.session_state.mcc = st.slider("**MCC (%)**", MCC_MIN, MCC_MAX, st.session_state.mcc, step=0.1)
-        st.session_state.moisture = st.slider("**Moisture Content (%)**", MOISTURE_MIN, MOISTURE_MAX, st.session_state.moisture, step=0.1)
+        st.session_state.mcc = st.slider("**MCC (%)**", MCC_MIN, MCC_MAX, st.session_state.mcc, step=0.1,
+            help="Microcrystalline cellulose — filler/binder that improves compressibility and flow; grade selected below.")
+        st.session_state.moisture = st.slider("**Moisture Content (%)**", MOISTURE_MIN, MOISTURE_MAX, st.session_state.moisture, step=0.1,
+            help="Residual water in the blend. Some moisture aids compressibility, but excess risks sticking, capping, or stability issues.")
         grade_idx = st.session_state.get('binder_grade', 0)
         if not isinstance(grade_idx, int) or grade_idx >= len(BINDER_GRADE_NAMES):
             grade_idx = 0
@@ -937,26 +1056,36 @@ def render_input_panel():
     st.caption("ℹ️ Only **Compression Pressure** and **Tableting Speed** currently feed into the model's predictions.")
     col3, col4 = st.columns(2)
     with col3:
-        st.session_state.pressure = st.slider("**Compression Pressure (MPa)**", PRESSURE_MIN, PRESSURE_MAX, st.session_state.pressure, step=2.0)
-        st.session_state.speed = st.slider("**Tableting Speed (rpm)**", SPEED_MIN, SPEED_MAX, st.session_state.speed, step=0.5)
+        st.session_state.pressure = st.slider("**Compression Pressure (MPa)**", PRESSURE_MIN, PRESSURE_MAX, st.session_state.pressure, step=2.0,
+            help="Force applied by the punches. Higher pressure raises density and tensile strength, up to a point — too high can cause capping/lamination.")
+        st.session_state.speed = st.slider("**Tableting Speed (rpm)**", SPEED_MIN, SPEED_MAX, st.session_state.speed, step=0.5,
+            help="Turret rotation speed. Faster speeds shorten dwell time under compression, which can reduce achievable density/tensile strength for the same pressure.")
         st.session_state.granule = st.slider("**Granule Size (µm)**", GRANULE_MIN, GRANULE_MAX, st.session_state.granule, step=5.0)
     with col4:
         st.session_state.dwell_time = st.slider("**Dwell Time (ms)**", DWELL_TIME_MIN, DWELL_TIME_MAX, st.session_state.dwell_time, step=1.0)
         st.session_state.friction = st.slider("**Friction Coefficient**", FRICTION_MIN, FRICTION_MAX, st.session_state.friction, step=0.01)
         st.session_state.decompression_time = st.slider("**Decompression Time (ms)**", DECOMPRESSION_TIME_MIN, DECOMPRESSION_TIME_MAX, st.session_state.decompression_time, step=2.0)
 def target_status(value, threshold, mode='min', comfortable=None):
+    """Returns (level, text). level in {'good','warn','bad'} drives the
+    color of the badge; text is the human-readable label. Kept as a
+    single source of truth so the badge color and the wording can never
+    drift apart, unlike deriving color separately from the emoji."""
     if mode == 'min':
         if value < threshold:
-            return "🔴 Below target"
+            return 'bad', "Below target"
         if comfortable is not None and value >= comfortable:
-            return "✅ Excellent"
-        return "✅ Passes (near limit)"
+            return 'good', "Excellent"
+        return 'warn', "Passes (near limit)"
     else:
         if value > threshold:
-            return "🔴 Exceeds limit"
+            return 'bad', "Exceeds limit"
         if comfortable is not None and value <= comfortable:
-            return "✅ Excellent"
-        return "⚠️ Passes (near limit)"
+            return 'good', "Excellent"
+        return 'warn', "Passes (near limit)"
+def _metric_with_badge(label, value_str, level, text):
+    st.metric(label, value_str)
+    st.markdown(status_badge_html(level, text), unsafe_allow_html=True)
+
 def render_results_summary(results):
     st.markdown("---")
     st.markdown("## 📊 Optimization Results")
@@ -964,19 +1093,21 @@ def render_results_summary(results):
     quality = calculate_quality_score(results['density'], results['tensile'], results['efrf'], api=api_val)
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric("**API%**", f"{api_val:.1f}%", "🎯 Target: maximize")
-        st.metric("**Density**", f"{results['density']:.3f}",
-                  target_status(results['density'], 0.80, mode='min', comfortable=0.85))
+        st.metric("**API%**", f"{api_val:.1f}%")
+        st.markdown(status_badge_html('good', "🎯 Target: maximize"), unsafe_allow_html=True)
+        d_level, d_text = target_status(results['density'], 0.80, mode='min', comfortable=0.85)
+        _metric_with_badge("**Density**", f"{results['density']:.3f}", d_level, d_text)
     with col2:
-        st.metric("**Tensile Strength**", f"{results['tensile']:.2f} MPa",
-                  target_status(results['tensile'], 1.5, mode='min', comfortable=3.0))
-        st.metric("**EFRF**", f"{results['efrf']:.3f}",
-                  target_status(results['efrf'], 0.40, mode='max', comfortable=0.30))
+        t_level, t_text = target_status(results['tensile'], 1.5, mode='min', comfortable=3.0)
+        _metric_with_badge("**Tensile Strength**", f"{results['tensile']:.2f} MPa", t_level, t_text)
+        e_level, e_text = target_status(results['efrf'], 0.40, mode='max', comfortable=0.30)
+        _metric_with_badge("**EFRF**", f"{results['efrf']:.3f}", e_level, e_text)
     with col3:
-        st.metric("**Disintegration Time**", f"{results['disintegration']:.1f} min",
-                  target_status(results['disintegration'], 15.0, mode='max', comfortable=10.0))
-        st.metric("**Overall Quality Score**", f"{quality['overall']:.1f}%",
-                  "Good" if quality['overall'] > 60 else "Needs Improvement")
+        di_level, di_text = target_status(results['disintegration'], 15.0, mode='max', comfortable=10.0)
+        _metric_with_badge("**Disintegration Time**", f"{results['disintegration']:.1f} min", di_level, di_text)
+        q_level = 'good' if quality['overall'] > 60 else 'bad'
+        q_text = "Good" if quality['overall'] > 60 else "Needs Improvement"
+        _metric_with_badge("**Overall Quality Score**", f"{quality['overall']:.1f}%", q_level, q_text)
     with st.expander("📊 Quality Score Breakdown", expanded=False):
         st.markdown(f"""
         | Component | Score | Weight | Contribution |
@@ -1076,33 +1207,24 @@ def render_pareto_evolution():
         marker=dict(size=8, color='#a3c4f3', line=dict(width=1, color='#4a6fa5')),
         hovertemplate='API: %{x:.2f}%<br>EFRF: %{y:.3f}<extra></extra>'
     ))
-    # ---- EXTENSION TO LIMIT 0.40 (SLANTED INSTEAD OF VERTICAL) ----
-    if len(api_sorted) > 0 and cummin_efrf[-1] < 0.40:
+    # ---- REGION WHERE NO SOLUTIONS WERE FOUND (was: a fabricated
+    # straight line drawn to the (API_MAX, 0.40) corner, styled
+    # identically to the real front — it visually implied optimizer
+    # results existed above the highest API actually reached, when
+    # nothing was ever evaluated there. Replaced with a clearly
+    # non-data-bearing shaded band + label so the boundary between
+    # "real result" and "outside what was explored" is unambiguous. ----
+    if len(api_sorted) > 0 and api_sorted[-1] < API_MAX:
         last_api = api_sorted[-1]
-        last_efrf = cummin_efrf[-1]
-        target_api = API_MAX  # 98.0
-        target_efrf = 0.40
-
-        # Draw a slanted line from the last Pareto point to (API_MAX, 0.40)
-        fig.add_trace(go.Scatter(
-            x=[last_api, target_api],
-            y=[last_efrf, target_efrf],
-            mode='lines',
-            name='Front extension to limit',
-            line=dict(color='red', width=2, dash='dash'),
-            showlegend=True,
-            hovertemplate='Extension to EFRF=0.40<extra></extra>'
-        ))
-        # Add a red cross marker at the limit point (API_MAX, 0.40)
-        fig.add_trace(go.Scatter(
-            x=[target_api],
-            y=[target_efrf],
-            mode='markers',
-            name='EFRF limit point',
-            marker=dict(size=8, color='red', symbol='cross'),
-            showlegend=True,
-            hovertemplate=f'API: {target_api:.2f}%<br>EFRF: 0.40<extra></extra>'
-        ))
+        fig.add_vrect(
+            x0=last_api, x1=API_MAX,
+            fillcolor='rgba(150,150,150,0.10)', line_width=0, layer='below'
+        )
+        fig.add_annotation(
+            x=(last_api + API_MAX) / 2, y=0.40, yshift=14, showarrow=False,
+            text=f"No Pareto solutions found above {last_api:.1f}% API<br>in this run",
+            font=dict(size=11, color='#868e96'), align='center'
+        )
     # --------------------------------------
     # Golden solution (already feasible)
     if golden:
@@ -1112,7 +1234,10 @@ def render_pareto_evolution():
             mode='markers',
             name='🏆 Golden Solution',
             marker=dict(size=22, color='gold', symbol='star', line=dict(width=1.5, color='#8a6d00')),
-            hovertemplate=f"<b>🏆 Golden Solution</b><br>API: {golden['API (%)']:.2f}%<br>EFRF: {golden['EFRF']:.3f}<extra></extra>"
+            hovertemplate=(f"<b>🏆 Golden Solution</b><br>API: {golden['API (%)']:.2f}%<br>"
+                            f"EFRF: {golden['EFRF']:.3f}<br>"
+                            "<i>Chosen by weighted API/Quality score,<br>"
+                            "not by minimizing EFRF — see note below</i><extra></extra>")
         ))
     # Tested formulation
     tested = st.session_state.get('results')
@@ -1150,38 +1275,53 @@ def render_pareto_evolution():
         f"**Generation {gen_display}/{NSGA_GENERATIONS}** · "
         f"Pareto-optimal solutions at this generation: {len(api_sorted)}"
     )
+    if golden and len(api_sorted) > 0:
+        st.caption(
+            "ℹ️ The red line shows the *best EFRF achieved at each API* — a 2D slice "
+            "of the real Pareto front, which also weighs Density and Tensile. The "
+            "🏆 Golden Solution is chosen by a weighted API/Quality score (set in the "
+            "sidebar), not by minimizing EFRF alone, so it can sit above this line "
+            "while still being non-dominated in the full 3-objective search — see the "
+            "3D Pareto front below for the complete picture."
+        )
 def render_golden_solution(golden):
     if not golden:
         return
     st.markdown("---")
     st.markdown("## 🏆 Golden Solution (Balanced Trade-off)")
-    density_status = target_status(golden['Density'], 0.80, mode='min', comfortable=0.85)
-    tensile_status = target_status(golden['Tensile (MPa)'], 1.5, mode='min', comfortable=3.0)
-    efrf_status = target_status(golden['EFRF'], 0.40, mode='max', comfortable=0.30)
+    density_level, density_text = target_status(golden['Density'], 0.80, mode='min', comfortable=0.85)
+    tensile_level, tensile_text = target_status(golden['Tensile (MPa)'], 1.5, mode='min', comfortable=3.0)
+    efrf_level, efrf_text = target_status(golden['EFRF'], 0.40, mode='max', comfortable=0.30)
+    # White, semi-transparent pill badges so the color language (good/warn/bad)
+    # still reads clearly against the purple gradient card.
+    pill_colors = {'good': 'rgba(64,192,87,0.35)', 'warn': 'rgba(255,169,77,0.35)', 'bad': 'rgba(255,107,107,0.35)'}
+    def _pill(text, level):
+        return (f'<span style="background:{pill_colors[level]}; padding:2px 9px; border-radius:999px; '
+                f'font-size:0.8rem; font-weight:600;">{text}</span>')
     st.markdown(f"""
     <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
                 padding: 20px; border-radius: 12px; color: white; box-shadow: 0 4px 12px rgba(0,0,0,0.15);">
-        <h3 style="color: white;">✨ Optimal Formulation</h3>
-        <p><b>API:</b> {golden['API (%)']:.1f}% &nbsp;|&nbsp;
+        <h3 style="color: white; margin-top:0;">✨ Optimal Formulation</h3>
+        <p style="opacity:0.95;"><b>API:</b> {golden['API (%)']:.1f}% &nbsp;|&nbsp;
            <b>Binder:</b> {golden['Binder (%)']:.1f}% &nbsp;|&nbsp;
            <b>PVPP:</b> {golden['PVPP (%)']:.1f}% &nbsp;|&nbsp;
            <b>MgSt:</b> {golden['MgSt (%)']:.2f}% &nbsp;|&nbsp;
            <b>MCC:</b> {golden['MCC (%)']:.1f}% &nbsp;|&nbsp;
            <b>Moisture:</b> {golden['Moisture (%)']:.1f}%</p>
-        <div style="display: flex; gap: 20px; flex-wrap: wrap; margin-top: 10px;">
-            <div><b>API%:</b> {golden['API (%)']:.1f}% 🎯 High</div>
-            <div><b>Density:</b> {golden['Density']:.3f} {density_status}</div>
-            <div><b>Tensile:</b> {golden['Tensile (MPa)']:.2f} MPa {tensile_status}</div>
-            <div><b>EFRF:</b> {golden['EFRF']:.3f} {efrf_status}</div>
-            <div><b>Quality Score:</b> {golden['Quality Score']:.1f}% 🏆 Best</div>
+        <div style="display: flex; gap: 14px; flex-wrap: wrap; margin-top: 12px;">
+            <div><b>API%:</b> {golden['API (%)']:.1f}% {_pill('High', 'good')}</div>
+            <div><b>Density:</b> {golden['Density']:.3f} {_pill(density_text, density_level)}</div>
+            <div><b>Tensile:</b> {golden['Tensile (MPa)']:.2f} MPa {_pill(tensile_text, tensile_level)}</div>
+            <div><b>EFRF:</b> {golden['EFRF']:.3f} {_pill(efrf_text, efrf_level)}</div>
+            <div><b>Quality Score:</b> {golden['Quality Score']:.1f}% {_pill('Best', 'good')}</div>
         </div>
     </div>
     """, unsafe_allow_html=True)
-    status_map = {'Density': density_status, 'Tensile': tensile_status, 'EFRF': efrf_status}
-    flagged = {name: s for name, s in status_map.items()
-               if "near limit" in s or "Below target" in s or "Exceeds limit" in s}
+    status_map = {'Density': (density_level, density_text), 'Tensile': (tensile_level, tensile_text),
+                  'EFRF': (efrf_level, efrf_text)}
+    flagged = {name: text for name, (level, text) in status_map.items() if level in ('warn', 'bad')}
     if flagged:
-        details = "; ".join(f"**{name}** ({s.split(' ', 1)[1] if ' ' in s else s})" for name, s in flagged.items())
+        details = "; ".join(f"**{name}** ({text})" for name, text in flagged.items())
         st.warning(f"⚠️ This is the best available trade-off among the Pareto-optimal solutions found, "
                    f"but {details} — worth reviewing before committing to this formulation.")
     else:
@@ -1406,121 +1546,131 @@ def _render_full_results():
                 st.warning("Could not compute local sensitivity.")
         else:
             st.warning("Model or Golden Solution missing for Sensitivity Analysis.")
+def _run_optimization(w_api, w_quality):
+    """The full Run Hybrid Optimization flow. Split out of main() so the
+    'Optimize & Results' tab body stays readable — tabs render all their
+    content on every rerun in Streamlit, so this needs to be a plain
+    function call, not inlined under a bare `if run_button:` spanning
+    a hundred lines."""
+    start_time = time.time()
+    valid, msg = validate_formulation(
+        st.session_state.api, st.session_state.binder,
+        st.session_state.pvpp, st.session_state.mgst,
+        st.session_state.mcc, st.session_state.moisture
+    )
+    if not valid:
+        st.error(f"❌ {msg}")
+        return
+    st.session_state.optimization_complete = True
+    train_start = time.time()
+    render_training_progress()
+    train_elapsed = round(time.time() - train_start, 1)
+    opt_progress = st.progress(0, text="Running NSGA-II generation 0/%d..." % NSGA_GENERATIONS)
+    def _update_opt_progress(gen, total):
+        frac = min(1.0, max(0.0, (gen + 1) / total))
+        opt_progress.progress(frac, text=f"Running NSGA-II generation {min(gen + 1, total)}/{total}...")
+
+    nsga_start = time.time()
+    solutions, golden_from_optimizer, gen_history, pareto_pop, pareto_obj = run_real_optimization(progress_callback=_update_opt_progress)
+    nsga_elapsed = round(time.time() - nsga_start, 1)
+    opt_progress.empty()
+
+    st.session_state.results = get_current_formulation_results()
+    st.session_state.pareto_history = gen_history
+    st.session_state.runtime = round(time.time() - start_time, 1)
+    st.session_state.train_time = train_elapsed
+    st.session_state.nsga_time = nsga_elapsed
+    st.session_state.sidebar_w_api = w_api
+    st.session_state.sidebar_w_quality = w_quality
+
+    model = st.session_state.get('_trained_model')
+    scaler = st.session_state.get('_trained_scaler')
+    if model is None or scaler is None:
+        st.error("Model or Scaler not found. Please ensure training completed successfully.")
+        st.stop()
+    # Filter Pareto front to only feasible solutions (EFRF < 0.40)
+    feasible_mask = pareto_obj[:, 2] < 0.40
+    if not np.any(feasible_mask):
+        st.error("No feasible Pareto solutions found (EFRF >= 0.40 for all). Try adjusting constraints.")
+        st.stop()
+    pareto_pop = pareto_pop[feasible_mask]
+    pareto_obj = pareto_obj[feasible_mask]
+    # ---- GOLDEN SOLUTION SELECTION (BALANCED SCORE USING QUALITY SCORE) ----
+    weights = np.array([w_api, w_quality])
+    best_score = -np.inf
+    golden = solutions[0]  # fallback
+    for sol in solutions:
+        score = (sol['API (%)'] / 100 * weights[0]) + ((sol['Quality Score'] / 100) * weights[1])
+        if score > best_score:
+            best_score = score
+            golden = sol
+    st.session_state.golden_solution = golden
+    # ------------------------------------------------------------------------
+    sorted_solutions = sorted(solutions, key=lambda s: (s['API (%)'] / 100 * weights[0]) + ((s['Quality Score'] / 100) * weights[1]), reverse=True)
+    st.session_state.best_solutions = sorted_solutions
+
+    st.success(f"🏆 Golden Solution Found! API: {golden['API (%)']:.2f}% | EFRF: {golden['EFRF']:.3f}")
+    st.caption(f"Optimization took {st.session_state.runtime:.2f} seconds "
+               f"(train/load: {train_elapsed}s, NSGA-II: {nsga_elapsed}s).")
+    st.balloons()
+    _render_full_results()
+
 def main():
+    inject_custom_css()
     w_api, w_quality = render_sidebar()
+    render_header()
+    st.write("")
 
-    st.markdown("# 🧬 Hybrid AI · Multi-Objective Tablet Optimization")
-    st.markdown("#### Nile Valley University · Sudan · v32.2-Integrated")
-    st.markdown("---")
-    render_input_panel()
-    render_binder_grade_comparison()
-    st.markdown("---")
-    col1, col2, col3 = st.columns([1, 2, 1])
-    with col1:
-        quick_predict = st.button("⚡ Quick Predict (current formulation)", use_container_width=True)
-    with col2:
-        run_button = st.button("🚀 Run Hybrid Optimization", type="primary", use_container_width=True)
-    if quick_predict:
-        valid, msg = validate_formulation(
-            st.session_state.api, st.session_state.binder,
-            st.session_state.pvpp, st.session_state.mgst,
-            st.session_state.mcc, st.session_state.moisture
-        )
-        if not valid:
-            st.error(f"❌ {msg}")
-        else:
-            with st.spinner("Running model prediction..."):
-                quick_results = get_current_formulation_results()
-            render_results_summary(quick_results)
-            st.info("This is a direct model prediction for the formulation currently set on the "
-                    "sliders — it does not run the NSGA-II search. Click **Run Hybrid Optimization** "
-                    "for a full Pareto-front search across the design space.")
-    if run_button:
-        start_time = time.time()
-        valid, msg = validate_formulation(
-            st.session_state.api, st.session_state.binder,
-            st.session_state.pvpp, st.session_state.mgst,
-            st.session_state.mcc, st.session_state.moisture
-        )
-        if not valid:
-            st.error(f"❌ {msg}")
-            return
-        st.session_state.optimization_complete = True
-        train_start = time.time()
-        render_training_progress()
-        train_elapsed = round(time.time() - train_start, 1)
-        opt_progress = st.progress(0, text="Running NSGA-II generation 0/%d..." % NSGA_GENERATIONS)
-        def _update_opt_progress(gen, total):
-            frac = min(1.0, max(0.0, (gen + 1) / total))
-            opt_progress.progress(frac, text=f"Running NSGA-II generation {min(gen + 1, total)}/{total}...")
+    # Tabs replace the previous single long vertical scroll (inputs ->
+    # binder chart -> buttons -> every result section stacked below) so
+    # formulation setup and results each get focused, navigable space.
+    tab_formulate, tab_optimize = st.tabs(["🧪 Formulate", "🚀 Optimize & Results"])
 
-        nsga_start = time.time()
-        solutions, golden_from_optimizer, gen_history, pareto_pop, pareto_obj = run_real_optimization(progress_callback=_update_opt_progress)
-        nsga_elapsed = round(time.time() - nsga_start, 1)
-        opt_progress.empty()
-
-        st.session_state.results = get_current_formulation_results()
-        st.session_state.pareto_history = gen_history
-        st.session_state.runtime = round(time.time() - start_time, 1)
-        st.session_state.train_time = train_elapsed
-        st.session_state.nsga_time = nsga_elapsed
-        st.session_state.sidebar_w_api = w_api
-        st.session_state.sidebar_w_quality = w_quality
-
-        model = st.session_state.get('_trained_model')
-        scaler = st.session_state.get('_trained_scaler')
-        if model is None or scaler is None:
-            st.error("Model or Scaler not found. Please ensure training completed successfully.")
-            st.stop()
-        # Filter Pareto front to only feasible solutions (EFRF < 0.40)
-        feasible_mask = pareto_obj[:, 2] < 0.40
-        if not np.any(feasible_mask):
-            st.error("No feasible Pareto solutions found (EFRF >= 0.40 for all). Try adjusting constraints.")
-            st.stop()
-        pareto_pop = pareto_pop[feasible_mask]
-        pareto_obj = pareto_obj[feasible_mask]
-        # ---- GOLDEN SOLUTION SELECTION (BALANCED SCORE USING QUALITY SCORE) ----
-        weights = np.array([w_api, w_quality])
-        best_score = -np.inf
-        golden = solutions[0]  # fallback
-        for sol in solutions:
-            score = (sol['API (%)'] / 100 * weights[0]) + ((sol['Quality Score'] / 100) * weights[1])
-            if score > best_score:
-                best_score = score
-                golden = sol
-        st.session_state.golden_solution = golden
-        # ------------------------------------------------------------------------
-        sorted_solutions = sorted(solutions, key=lambda s: (s['API (%)'] / 100 * weights[0]) + ((s['Quality Score'] / 100) * weights[1]), reverse=True)
-        st.session_state.best_solutions = sorted_solutions
-
-        st.success(f"🏆 Golden Solution Found!\nAPI: {golden['API (%)']:.2f}% | EFRF: {golden['EFRF']:.3f}")
-        st.caption(f"Optimization took {st.session_state.runtime:.2f} seconds "
-                   f"(train/load: {train_elapsed}s, NSGA-II: {nsga_elapsed}s).")
-        st.balloons()
-        # NOTE: previously this branch rendered the full result section
-        # inline (Pareto plots, 3D plot, golden solution, comparisons,
-        # summary, sensitivity analysis) and then called st.rerun(),
-        # which threw all of that away and re-rendered it a second time
-        # via the `elif` branch below. _render_full_results() is now
-        # called exactly once, right here, reading from the session_state
-        # that was just populated above — no rerun needed.
-        _render_full_results()
-    elif st.session_state.optimization_complete and st.session_state.results:
-        render_results_summary(st.session_state.results)
-        _render_full_results()
-    else:
-        st.info("👆 Adjust parameters and click 'Run Hybrid Optimization' to begin.")
+    with tab_formulate:
+        render_input_panel()
+        render_binder_grade_comparison()
         st.markdown("---")
-        st.markdown("### 🎯 Key Features")
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.markdown("**🧠 Physics-Informed AI**")
-            st.markdown("**📊 API & Tensile Penalties**")
-        with col2:
-            st.markdown("**⚖️ Mass Balance Enforced**")
-            st.markdown("**🔬 PINN Constraints**")
-        with col3:
-            st.markdown("**📈 Pareto Front**")
-            st.markdown("**🏆 Golden Solution**")
+        quick_predict = st.button("⚡ Quick Predict (current formulation)", use_container_width=True,
+                                   help="Direct model prediction for the sliders as set — skips the NSGA-II search.")
+        if quick_predict:
+            valid, msg = validate_formulation(
+                st.session_state.api, st.session_state.binder,
+                st.session_state.pvpp, st.session_state.mgst,
+                st.session_state.mcc, st.session_state.moisture
+            )
+            if not valid:
+                st.error(f"❌ {msg}")
+            else:
+                with st.spinner("Running model prediction..."):
+                    quick_results = get_current_formulation_results()
+                render_results_summary(quick_results)
+                st.info("This is a direct model prediction for the formulation currently set on the "
+                        "sliders — it does not run the NSGA-II search. Switch to the "
+                        "**🚀 Optimize & Results** tab and click **Run Hybrid Optimization** "
+                        "for a full Pareto-front search across the design space.")
+
+    with tab_optimize:
+        run_button = st.button("🚀 Run Hybrid Optimization", type="primary", use_container_width=True,
+                                help="Runs the full NSGA-II search across the design space using the trained physics-informed model.")
+        if run_button:
+            _run_optimization(w_api, w_quality)
+        elif st.session_state.optimization_complete and st.session_state.results:
+            render_results_summary(st.session_state.results)
+            _render_full_results()
+        else:
+            st.info("👆 Set your formulation on the **🧪 Formulate** tab, then click "
+                    "'Run Hybrid Optimization' to begin.")
+            st.markdown("---")
+            st.markdown("### 🎯 Key Features")
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.markdown("**🧠 Physics-Informed AI**")
+                st.markdown("**📊 API & Tensile Penalties**")
+            with col2:
+                st.markdown("**⚖️ Mass Balance Projected**")
+                st.markdown("**🔬 PINN Constraints**")
+            with col3:
+                st.markdown("**📈 Pareto Front**")
+                st.markdown("**🏆 Golden Solution**")
 if __name__ == "__main__":
     main()
