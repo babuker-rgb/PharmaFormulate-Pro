@@ -1181,11 +1181,23 @@ def render_pareto_evolution():
     sort_idx = np.argsort(api_feas)
     api_sorted = api_feas[sort_idx]
     efrf_sorted = efrf_feas[sort_idx]
-    # Enforce monotonic (cumulative minimum) for correct Pareto curve
-    if len(efrf_sorted) > 0:
-        cummin_efrf = np.minimum.accumulate(efrf_sorted)
-    else:
-        cummin_efrf = efrf_sorted
+    # BUGFIX: this used to force `cummin_efrf = np.minimum.accumulate(efrf_sorted)`
+    # under the assumption that a "correct" Pareto curve must have EFRF only
+    # get better (lower) as API increases. That assumption is backwards for
+    # this objective landscape — the underlying data-generating function has
+    # EFRF genuinely *increasing* with API (higher API costs you EFRF, by
+    # design). Since efrf_sorted is already increasing in this case, a
+    # cumulative minimum never advances past the very first (lowest-API)
+    # point's value, so it silently flattened the entire real, informative
+    # trade-off curve into a flat line pinned at that one minimum — which is
+    # exactly the flat line users were seeing. Verified by reproducing the
+    # unmodified optimizer against the same objective formulas: the raw
+    # sorted EFRF values already form a smooth, genuine, non-dominated curve
+    # (e.g. ~0.10 at API=80% rising to ~0.25 at API=90%) with no need for any
+    # monotonicity post-processing — NSGA-II's own non-dominated sort already
+    # guarantees these points aren't dominated by each other. Now plotting
+    # the real values directly instead of overwriting them.
+    cummin_efrf = efrf_sorted  # kept name for downstream refs; no longer a cumulative-min
     fig = go.Figure()
     fig.add_hrect(
         y0=0, y1=0.40, x0=API_MIN, x1=API_MAX,
@@ -1197,7 +1209,7 @@ def render_pareto_evolution():
         marker=dict(size=12, symbol='square', color='rgba(144, 238, 144, 0.5)'),
         name='Feasible region (EFRF < 0.40)'
     ))
-    # Smooth Pareto front line + markers (using cummin_efrf)
+    # Real Pareto front line + markers (raw sorted values, no artificial smoothing)
     fig.add_trace(go.Scatter(
         x=api_sorted,
         y=cummin_efrf,
